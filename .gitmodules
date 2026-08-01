@@ -1,0 +1,9 @@
+[submodule "teleop/televuer"]
+	path = teleop/televuer
+	url = git@github-qing:qingshankeji/televuer.git
+[submodule "teleop/robot_control/dex-retargeting"]
+	path = teleop/robot_control/dex-retargeting
+	url = git@github-qing:qingshankeji/dex-retargeting.git
+[submodule "teleop/teleimager"]
+	path = teleop/teleimager
+	url = git@github-qing:qingshankeji/teleimager.git
