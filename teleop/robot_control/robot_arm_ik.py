@@ -25,12 +25,9 @@ class G1_29_ArmIK:
         # fixed cache file path
         self.cache_path = "g1_29_model_cache.pkl"
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../assets/g1/'
-        else:
-            self.urdf_path = '../../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../../assets/g1/'
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.urdf_path = os.path.join(base_dir, 'assets', 'g1', 'g1_body29_hand14.urdf')
+        self.model_dir = os.path.join(base_dir, 'assets', 'g1')
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
