@@ -3,7 +3,7 @@
 	url = git@github-qing:qingshankeji/televuer.git
 [submodule "teleop/robot_control/dex-retargeting"]
 	path = teleop/robot_control/dex-retargeting
-	url = git@github-qing:qingshankeji/dex-retargeting.git
+	url = https://github.com/dexsuite/dex-retargeting.git
 [submodule "teleop/teleimager"]
 	path = teleop/teleimager
 	url = git@github-qing:qingshankeji/teleimager.git
