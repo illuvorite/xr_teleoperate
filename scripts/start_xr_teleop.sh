@@ -1,13 +1,14 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-conda activate tv
-echo "[xr_teleop] activated conda env: $(conda info --envs | grep '\*' | awk '{print $1}')"
+# Activate Python 3.8 virtual environment
+source "${REPO_ROOT}/venv/bin/activate"
+echo "[xr_teleop] activated venv: $(python --version)"
 
-cd "$REPO_ROOT"
+cd "${REPO_ROOT}"
 
 python teleop/teleop_hand_and_arm.py \
   --arm G1_29 \
