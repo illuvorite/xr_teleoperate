@@ -1,0 +1,194 @@
+﻿version: "3.9"
+
+services:
+  # ================================================================
+  # 主遥操作服务
+  # ================================================================
+  xr-teleoperate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: xr-teleoperate
+    image: xr-teleoperate:latest
+    restart: unless-stopped
+
+    # GPU 支持 (NVIDIA Container Toolkit)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+        limits:
+          memory: 16G
+          cpus: '8'
+
+    # 环境变量
+    environment:
+      # 使用项目自带证书（已在 Dockerfile 中复制到 /workspace/certs/）
+      - XR_TELEOP_CERT=/workspace/certs/cert.pem
+      - XR_TELEOP_KEY=/workspace/certs/key.pem
+      - XR_TELEOP_ARM=${XR_TELEOP_ARM:-G1_29}
+      - XR_TELEOP_FREQUENCY=${XR_TELEOP_FREQUENCY:-30.0}
+      - XR_TELEOP_INPUT_MODE=${XR_TELEOP_INPUT_MODE:-controller}
+      - XR_TELEOP_DISPLAY_MODE=${XR_TELEOP_DISPLAY_MODE:-immersive}
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+      - DDS_INTERFACE=${DDS_INTERFACE:-eth0}
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+
+    # 数据卷挂载
+    volumes:
+      # 持久化录制数据
+      - ../data:/workspace/data
+      # 日志持久化
+      - ../guidelogs:/workspace/guidelogs
+      # IK 缓存加速（只读）
+      - ../g1_29_model_cache.pkl:/workspace/g1_29_model_cache.pkl:ro
+      # 相机配置文件（只读）
+      - ../teleop/teleimager/cam_config_server.yaml:/workspace/teleop/teleimager/cam_config_server.yaml:ro
+      # X11 / Wayland 显示转发
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # 共享内存 (IPC 性能关键)
+      - /dev/shm:/dev/shm
+      # USB 摄像头访问
+      - /dev/bus/usb:/dev/bus/usb
+      # NVIDIA 驱动
+      - /usr/local/nvidia:/usr/local/nvidia:ro
+
+    # 网络模式：host 模式确保最低延迟（DDS + WebRTC）
+    # teleimager 在同一台宿主机上，也使用 host 模式
+    network_mode: host
+
+    # 特权模式（用于访问 USB 摄像头和 DDS）
+    privileged: true
+
+    # 安全选项
+    security_opt:
+      - seccomp:unconfined
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "bash", "/workspace/scripts/docker_healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # 遥操作启动命令（controller 模式 + motion + static-dashboard）
+    # IMG_SERVER_IP 通过环境变量注入，默认 192.168.2.203，需改为宿主机实际 IP
+    command: >
+      python teleop/teleop_hand_and_arm.py
+        --arm G1_29
+        --input-mode controller
+        --display-mode immersive
+        --network-interface eth0
+        --img-server-ip ${IMG_SERVER_IP}
+        --motion
+        --static-dashboard
+
+  # ================================================================
+  # 图像服务（必选服务 - teleimager）
+  # 负责头戴摄像头图像采集与 WebRTC 流媒体
+  # 与 xr-teleoperate 同机部署，使用 host 网络模式
+  # ================================================================
+  teleimager:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: teleimager
+    image: teleimager:latest
+    restart: unless-stopped
+
+    environment:
+      - XR_TELEOP_CERT=/workspace/certs/cert.pem
+      - XR_TELEOP_KEY=/workspace/certs/key.pem
+      - DISPLAY=${DISPLAY:-:0}
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+
+    volumes:
+      # 使用项目自带证书
+      - ../teleop/televuer/cert.pem:/workspace/certs/cert.pem:ro
+      - ../teleop/televuer/key.pem:/workspace/certs/key.pem:ro
+      # 相机配置
+      - ../teleop/teleimager/cam_config_server.yaml:/workspace/teleop/teleimager/cam_config_server.yaml:ro
+      - ../teleop/teleimager/cam_config_server_opencv.yaml:/workspace/teleop/teleimager/cam_config_server_opencv.yaml:ro
+      - ../teleop/teleimager/cam_config_server_realsense.yaml:/workspace/teleop/teleimager/cam_config_server_realsense.yaml:ro
+      # 数据持久化
+      - teleimager-data:/workspace/data
+      # USB 摄像头
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev/video0:/dev/video0
+      # X11 转发
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    # 同一台宿主机，使用 host 网络模式
+    # teleimager-server 默认绑定 0.0.0.0，在 host 模式下直接监听宿主机所有 IP
+    network_mode: host
+
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+
+    command: >
+      bash -c "
+        echo '123' | sudo -S modprobe -r uvcvideo || true &&
+        echo '123' | sudo -S modprobe uvcvideo debug=0 &&
+        teleimager-server --rs
+      "
+
+  # ================================================================
+  # Isaac Lab 仿真服务（可选）
+  # ================================================================
+  simulation:
+    image: nvcr.io/nvidia/isaac-lab:2.1.0
+    container_name: isaac-sim
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+        limits:
+          memory: 32G
+          cpus: '16'
+
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+
+    volumes:
+      - ../:/workspace/xr_teleoperate:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev/shm:/dev/shm
+      - isaac-cache:/root/.cache/isaaclab
+
+    network_mode: host
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+
+    command: >
+      bash -c "
+        source /opt/conda/etc/profile.d/conda.sh &&
+        conda activate unitree_sim_env &&
+        cd /workspace/xr_teleoperate &&
+        python teleop/teleop_hand_and_arm.py --sim --ee=dex3
+      "
+
+# ================================================================
+# 命名卷
+# ================================================================
+volumes:
+  xr-teleoperate-config:
+    driver: local
+  teleimager-data:
+    driver: local
+  isaac-cache:
+    driver: local

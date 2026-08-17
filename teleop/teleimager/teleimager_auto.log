@@ -1,0 +1,622 @@
+2026-08-06 08:40:21 [配置] 切换到 realsense
+2026-08-06 08:40:21 [启动] teleimager-server --rs 已启动
+08:40:22.176283 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:40:22.199209 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:40:24.596040 INFO     UVC driver reloaded successfully.   image_server.py:542
+08:40:26.733328 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+08:40:26.827163 INFO     [RealSenseCamera: head_camera]      image_server.py:933
+                         initialized with 480x640 @ 30 FPS.                     
+                         ZMQ: enabled, zmq_port=55555;                          
+                         WebRTC: enabled, webrtc_port=60001                     
+08:40:26.827678 INFO     [Image Server] Image server has    image_server.py:1333
+                         started, waiting for client                            
+                         connections...                                         
+08:40:27.287411 INFO     [Image Server] head_camera is      image_server.py:1456
+                         ready.                                                 
+08:40:27.290380 INFO     [Image Server] Running... Press    image_server.py:1562
+                         Ctrl+C to exit.                                        
+08:40:41.271791 INFO     [Image Server] Received signal 2,  image_server.py:1480
+                         initiating graceful shutdown...                        
+08:40:41.384524 INFO     [RealSenseCamera] Released         image_server.py:1001
+                         head_camera                                            
+08:40:41.385008 INFO     [Image Server] Clean up completed. image_server.py:1427
+                         Server stopped.                                        
+2026-08-06 08:40:56 [配置] 切换到 realsense
+2026-08-06 08:40:56 [启动] teleimager-server --rs 已启动
+08:40:58.180239 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:40:58.204839 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:41:00.547236 INFO     UVC driver reloaded successfully.   image_server.py:542
+08:41:02.678584 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+08:41:02.766307 INFO     [RealSenseCamera: head_camera]      image_server.py:933
+                         initialized with 480x640 @ 30 FPS.                     
+                         ZMQ: enabled, zmq_port=55555;                          
+                         WebRTC: enabled, webrtc_port=60001                     
+08:41:02.767205 INFO     [Image Server] Image server has    image_server.py:1333
+                         started, waiting for client                            
+                         connections...                                         
+08:41:03.242220 INFO     [Image Server] head_camera is      image_server.py:1456
+                         ready.                                                 
+08:41:03.244572 INFO     [Image Server] Running... Press    image_server.py:1562
+                         Ctrl+C to exit.                                        
+08:42:51.465035 INFO     [WebRTC] Preferred H264 for         image_server.py:373
+                         port:60001                                             
+08:44:20.313195 INFO     [Image Server] Received signal 2,  image_server.py:1480
+                         initiating graceful shutdown...                        
+08:44:20.477877 INFO     [RealSenseCamera] Released         image_server.py:1001
+                         head_camera                                            
+08:44:20.478387 INFO     [Image Server] Clean up completed. image_server.py:1427
+                         Server stopped.                                        
+[2026-08-06 08:44:31] [调试] 分流监控已启动
+[2026-08-06 08:44:37] [调试] 启动时检测结果：realsense
+[2026-08-06 08:44:37] [配置] 已切换到 realsense
+[2026-08-06 08:44:37] [启动] 正在启动 teleimager-server --rs
+08:44:39.164087 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:44:39.185712 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:44:41.542783 INFO     UVC driver reloaded successfully.   image_server.py:542
+08:44:43.674641 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+08:44:43.762273 INFO     [RealSenseCamera: head_camera]      image_server.py:933
+                         initialized with 480x640 @ 30 FPS.                     
+                         ZMQ: enabled, zmq_port=55555;                          
+                         WebRTC: enabled, webrtc_port=60001                     
+08:44:43.762804 INFO     [Image Server] Image server has    image_server.py:1333
+                         started, waiting for client                            
+                         connections...                                         
+08:44:44.234547 INFO     [Image Server] head_camera is      image_server.py:1456
+                         ready.                                                 
+08:44:44.241163 INFO     [Image Server] Running... Press    image_server.py:1562
+                         Ctrl+C to exit.                                        
+[2026-08-06 08:44:51] [调试] 当前仍为 realsense，无需切换
+[2026-08-06 08:45:05] [调试] 当前仍为 realsense，无需切换
+[2026-08-06 08:45:18] [调试] 当前仍为 realsense，无需切换
+[2026-08-06 08:45:32] [调试] 当前仍为 realsense，无需切换
+08:45:44.904671 INFO     [Image Server] Received signal 2,  image_server.py:1480
+                         initiating graceful shutdown...                        
+08:45:45.100235 INFO     [RealSenseCamera] Released         image_server.py:1001
+                         head_camera                                            
+08:45:45.100854 INFO     [Image Server] Clean up completed. image_server.py:1427
+                         Server stopped.                                        
+[2026-08-06 08:46:06] [调试] 分流监控已启动
+[2026-08-06 08:46:13] [调试] 启动时检测结果：realsense
+[2026-08-06 08:46:13] [配置] 已切换到 realsense
+[2026-08-06 08:46:13] [启动] 正在启动 teleimager-server --rs
+08:46:14.616534 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:46:14.638123 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:46:16.997538 INFO     UVC driver reloaded successfully.   image_server.py:542
+08:46:19.158512 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+08:46:19.246634 INFO     [RealSenseCamera: head_camera]      image_server.py:933
+                         initialized with 480x640 @ 30 FPS.                     
+                         ZMQ: enabled, zmq_port=55555;                          
+                         WebRTC: enabled, webrtc_port=60001                     
+08:46:19.247138 INFO     [Image Server] Image server has    image_server.py:1333
+                         started, waiting for client                            
+                         connections...                                         
+08:46:19.715295 INFO     [Image Server] head_camera is      image_server.py:1456
+                         ready.                                                 
+08:46:19.718828 INFO     [Image Server] Running... Press    image_server.py:1562
+                         Ctrl+C to exit.                                        
+08:46:21.902597 INFO     [WebRTC] Preferred H264 for         image_server.py:373
+                         port:60001                                             
+08:48:24.006097 INFO     [Image Server] Received signal 2,  image_server.py:1480
+                         initiating graceful shutdown...                        
+08:48:24.202040 INFO     [RealSenseCamera] Released         image_server.py:1001
+                         head_camera                                            
+08:48:24.202708 INFO     [Image Server] Clean up completed. image_server.py:1427
+                         Server stopped.                                        
+[2026-08-06 08:48:25] [调试] 分流监控已启动
+[2026-08-06 08:48:32] [调试] 启动时检测结果：realsense
+[2026-08-06 08:48:32] [配置] 已切换到 realsense
+[2026-08-06 08:48:32] [启动] 正在启动 teleimager-server --rs
+08:48:33.192029 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:48:33.213199 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:48:35.548669 INFO     UVC driver reloaded successfully.   image_server.py:542
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/bin/teleimager-server", line 6, in <module>
+    sys.exit(main())
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 1555, in main
+    server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 1213, in __init__
+    self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 577, in __init__
+    self.uvc_rgb_video_paths = self._list_uvc_rgb_video_paths()
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 611, in _list_uvc_rgb_video_paths
+    return [p for p in self.video_paths if self._is_like_rgb(p) and p not in self.rs_video_paths]
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 611, in <listcomp>
+    return [p for p in self.video_paths if self._is_like_rgb(p) and p not in self.rs_video_paths]
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 717, in _is_like_rgb
+    ret, frame = cap.read()
+KeyboardInterrupt
+[2026-08-06 08:48:52] [调试] 分流监控已启动
+[2026-08-06 08:48:59] [调试] 启动时检测结果：realsense
+[2026-08-06 08:48:59] [配置] 已切换到 realsense
+[2026-08-06 08:48:59] [启动] 正在启动 teleimager-server --rs
+08:49:00.253007 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:49:00.274017 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:49:02.616808 INFO     UVC driver reloaded successfully.   image_server.py:542
+08:49:04.794238 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+08:49:04.973887 ERROR    [Image Server] Initialization      image_server.py:1329
+                         failed: [RealSenseCamera] Failed                       
+                         to initialize RealSense camera                         
+                         349522071964: Couldn't resolve                         
+                         requests                                               
+Traceback (most recent call last):
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 923, in __init__
+    profile = self.pipeline.start(config)
+RuntimeError: Couldn't resolve requests
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/bin/teleimager-server", line 6, in <module>
+    sys.exit(main())
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 1555, in main
+    server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 1279, in __init__
+    self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 940, in __init__
+    raise RuntimeError(f"[RealSenseCamera] Failed to initialize RealSense camera {self._serial_number}: {e}")
+RuntimeError: [RealSenseCamera] Failed to initialize RealSense camera 349522071964: Couldn't resolve requests
+08:49:04.995045 INFO     [Image Server] Clean up completed. image_server.py:1427
+                         Server stopped.                                        
+[2026-08-06 08:52:27] [调试] 分流监控已启动
+[2026-08-06 08:52:34] [调试] 启动时检测结果：realsense
+[2026-08-06 08:52:34] [配置] 已切换到 realsense
+[2026-08-06 08:52:34] [启动] 正在启动 teleimager-server --rs
+08:52:35.359070 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:52:35.380550 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:52:37.709529 INFO     UVC driver reloaded successfully.   image_server.py:542
+08:52:39.848140 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+08:52:40.027394 ERROR    [Image Server] Initialization      image_server.py:1329
+                         failed: [RealSenseCamera] Failed                       
+                         to initialize RealSense camera                         
+                         349522071964: Couldn't resolve                         
+                         requests                                               
+Traceback (most recent call last):
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 923, in __init__
+    profile = self.pipeline.start(config)
+RuntimeError: Couldn't resolve requests
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/bin/teleimager-server", line 6, in <module>
+    sys.exit(main())
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 1555, in main
+    server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 1279, in __init__
+    self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
+  File "/home/unitree/xr_teleoperate-main/teleop/teleimager/src/teleimager/image_server.py", line 940, in __init__
+    raise RuntimeError(f"[RealSenseCamera] Failed to initialize RealSense camera {self._serial_number}: {e}")
+RuntimeError: [RealSenseCamera] Failed to initialize RealSense camera 349522071964: Couldn't resolve requests
+08:52:40.048913 INFO     [Image Server] Clean up completed. image_server.py:1427
+                         Server stopped.                                        
+[2026-08-06 08:57:41] [调试] 分流监控已启动
+[2026-08-06 08:57:48] [调试] 启动时检测结果：realsense
+[2026-08-06 08:57:48] [配置] 已切换到 realsense
+[2026-08-06 08:57:48] [启动] 正在启动 teleimager-server --rs
+08:57:49.389761 INFO                                        image_server.py:1511
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+08:57:49.410153 INFO     [Performance] CPU Affinity locked  image_server.py:1490
+                         to: [0, 1, 2]                                          
+08:57:51.737061 INFO     UVC driver reloaded successfully.   image_server.py:542
+08:57:53.874364 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+08:57:53.962709 INFO     [RealSenseCamera: head_camera]      image_server.py:933
+                         initialized with 480x640 @ 30 FPS.                     
+                         ZMQ: enabled, zmq_port=55555;                          
+                         WebRTC: enabled, webrtc_port=60001                     
+08:57:53.963219 INFO     [Image Server] Image server has    image_server.py:1333
+                         started, waiting for client                            
+                         connections...                                         
+08:57:54.436977 INFO     [Image Server] head_camera is      image_server.py:1456
+                         ready.                                                 
+08:57:54.439174 INFO     [Image Server] Running... Press    image_server.py:1562
+                         Ctrl+C to exit.                                        
+08:58:17.042565 INFO     [WebRTC] Preferred H264 for         image_server.py:373
+                         port:60001                                             
+09:14:08.494588 INFO     [Image Server] Received signal 2,  image_server.py:1480
+                         initiating graceful shutdown...                        
+09:14:08.564209 INFO     [RealSenseCamera] Released         image_server.py:1001
+                         head_camera                                            
+09:14:08.565079 INFO     [Image Server] Clean up completed. image_server.py:1427
+                         Server stopped.                                        
+[2026-08-06 09:16:29] [调试] 分流监控已启动
+[2026-08-06 09:16:36] [调试] 启动时检测结果：realsense
+[2026-08-06 09:16:36] [配置] 已切换到 realsense
+[2026-08-06 09:16:36] [启动] 正在启动 teleimager-server --rs
+09:16:37.976057 INFO                                        image_server.py:1638
+                         ====================== Image                           
+                         Server Startup Guide                                   
+                         ======================                                 
+                         Please first read this repo's                          
+                         README.md to learn how to                              
+                         configure and use the teleimager.                      
+                         To discover connected cameras, run                     
+                         the following command:                                 
+                                                                                
+                             teleimager-server --cf                             
+                                                                                
+                         The '--cf' flag means 'camera                          
+                         find'.                                                 
+                         This will list all detected                            
+                         cameras and their details (video                       
+                         paths, serial numbers and physical                     
+                         path etc.).                                            
+                         Use that information to fill in                        
+                         your 'cam_config_server.yaml'                          
+                         file.                                                  
+                         Once configured, you can start the                     
+                         image server with:                                     
+                                                                                
+                             teleimager-server                                  
+                                                                                
+                         Note:                                                  
+                          - If you have RealSense cameras,                      
+                         add the '--rs' flag to enable                          
+                         RealSense support.                                     
+                          - Make sure you have proper                           
+                         permissions to access the camera                       
+                         devices (e.g., run with sudo or                        
+                         set udev rules).                                       
+                         ==================================                     
+                         ==================================                     
+                         ======                                                 
+09:16:37.997771 INFO     [Performance] CPU Affinity locked  image_server.py:1617
+                         to: [0, 1, 2]                                          
+09:16:40.360675 INFO     UVC driver reloaded successfully.   image_server.py:669
+09:16:42.487370 INFO     [Responser] Camera Config Responser image_client.py:564
+                         initialized at 0.0.0.0:60000                           
+09:16:42.573846 INFO     [RealSenseCamera: head_camera]     image_server.py:1060
+                         initialized with 480x640 @ 30 FPS.                     
+                         ZMQ: enabled, zmq_port=55555;                          
+                         WebRTC: enabled, webrtc_port=60001                     
+09:16:42.574357 INFO     [Image Server] Image server has    image_server.py:1460
+                         started, waiting for client                            
+                         connections...                                         
+09:16:43.050817 INFO     [Image Server] head_camera is      image_server.py:1583
+                         ready.                                                 
+09:16:43.053599 INFO     [Image Server] Running... Press    image_server.py:1689
+                         Ctrl+C to exit.                                        
+09:16:48.570276 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:17:08.015643 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:24:53.654422 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:25:48.707607 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:26:22.979239 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:27:01.031145 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:32:46.136347 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:33:14.764407 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:34:12.420729 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:43:37.813367 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:43:51.106441 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:44:21.650979 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:48:24.792155 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:48:40.229892 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:48:58.041898 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:51:45.463692 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:52:05.271890 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:52:45.231608 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:53:22.785701 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:54:38.089060 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:56:11.561134 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             
+09:58:28.778811 INFO     [WebRTC] Preferred H264 for         image_server.py:500
+                         port:60001                                             

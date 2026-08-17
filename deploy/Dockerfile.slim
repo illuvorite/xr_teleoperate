@@ -1,0 +1,82 @@
+﻿# ============================================================
+# Single-stage slim build for xr_teleoperate
+# Target: Ubuntu 20.04 (focal)
+# Python: 3.8 (system default on Ubuntu 20.04)
+# Uses project-builtin certificates from teleop/televuer/
+# ============================================================
+FROM nvidia/cuda:12.4.1-cudnn9-devel-ubuntu20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+ENV PYTHONUNBUFFERED=1
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV XR_TELEOP_CERT=/workspace/certs/cert.pem \
+    XR_TELEOP_KEY=/workspace/certs/key.pem \
+    XR_TELEOP_ARM=G1_29 \
+    XR_TELEOP_FREQUENCY=30.0 \
+    XR_TELEOP_INPUT_MODE=controller \
+    XR_TELEOP_DISPLAY_MODE=immersive \
+    IMG_SERVER_IP=192.168.2.203 \
+    DDS_INTERFACE=eth0
+
+# ---- System Dependencies ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git git-lfs curl wget ca-certificates \
+    # Python 3.8 is the default on Ubuntu 20.04
+    python3.8 python3.8-dev python3.8-distutils python3.8-venv \
+    python3-setuptools python3-wheel \
+    python3-pip \
+    build-essential cmake pkg-config \
+    libopencv-dev libgl1-mesa-glx libglu1-mesa \
+    libzmq3-dev libyaml-dev libboost-all-dev libspdlog-dev \
+    libusb-1.0-0-dev libudev-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create venv with Python 3.8
+RUN python3.8 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# ---- Copy dependency files and install ----
+WORKDIR /workspace
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY teleop/teleimager/pyproject.toml teleop/teleimager/
+COPY teleop/televuer/pyproject.toml teleop/televuer/
+COPY teleop/robot_control/dex-retargeting/pyproject.toml teleop/robot_control/dex-retargeting/
+
+RUN pip install --no-cache-dir -e teleop/teleimager --no-deps \
+    && pip install --no-cache-dir -e teleop/televuer \
+    && pip install --no-cache-dir -e teleop/robot_control/dex-retargeting --no-deps \
+    && git clone --depth 1 https://github.com/unitreerobotics/unitree_sdk2_python.git /tmp/unitree_sdk2 \
+    && pip install --no-cache-dir -e /tmp/unitree_sdk2 \
+    && rm -rf /tmp/unitree_sdk2
+
+# ---- Copy application source ----
+COPY . .
+
+# ---- Use project-builtin certificates ----
+RUN mkdir -p /workspace/certs /root/.config/xr_teleoperate \
+    && cp teleop/televuer/cert.pem /workspace/certs/cert.pem \
+    && cp teleop/televuer/key.pem /workspace/certs/key.pem \
+    && ln -sf /workspace/certs/cert.pem /root/.config/xr_teleoperate/cert.pem \
+    && ln -sf /workspace/certs/key.pem /root/.config/xr_teleoperate/key.pem
+
+# ---- Install entrypoint script ----
+COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# ---- Runtime directories ----
+RUN mkdir -p /workspace/data /workspace/guidelogs
+
+# ---- Exposed Ports ----
+EXPOSE 8012/tcp 8012/udp
+EXPOSE 60001/tcp 60001/udp
+EXPOSE 7441/udp 7447/udp 7557/udp
+EXPOSE 7000/tcp
+EXPOSE 9090/tcp
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["python3", "teleop/teleop_hand_and_arm.py", "--arm", "G1_29", "--input-mode", "controller", "--display-mode", "immersive", "--network-interface", "eth0", "--motion", "--static-dashboard"]

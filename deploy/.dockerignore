@@ -1,0 +1,14 @@
+﻿# Docker build context exclusions
+# Do NOT exclude *.pkl - g1_29_model_cache.pkl is needed at runtime
+.git
+**/.git
+**/node_modules
+**/__pycache__
+**/*.pyc
+.kilo
+*.log
+data/
+guidelogs/
+img/
+docs/
+dist/

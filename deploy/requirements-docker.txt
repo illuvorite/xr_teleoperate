@@ -1,0 +1,25 @@
+﻿# Core scientific stack (compatible with submodules)
+numpy==1.26.4
+matplotlib==3.7.5
+
+# Teleoperation
+rerun-sdk==0.20.1
+meshcat==0.3.2
+sshkeyboard==2.3.1
+
+# XR & Communication
+vuer[all]==0.0.60
+logging-mp
+opencv-python>=4.8
+pyzmq>=25.0
+pyyaml>=6.0
+
+# Robotics
+torch==2.3.0
+pin==2.7.0
+pytransform3d>=3.5.0
+nlopt>=2.6.1,<2.8.0
+trimesh>=4.4.0
+anytree>=2.12.0
+lxml>=5.2.2
+casadi>=3.6.0

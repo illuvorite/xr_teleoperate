@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Viewer WS Diag</title>
+</head>
+<body>
+<pre id="log"></pre>
+<script>
+const el = document.getElementById('log');
+function log(msg) {
+  const line = document.createElement('div');
+  line.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+  el.appendChild(line);
+}
+function error(msg, err) {
+  const line = document.createElement('div');
+  line.textContent = new Date().toLocaleTimeString() + ' ERROR ' + msg + ' ' + (err && err.message || err);
+  el.appendChild(line);
+}
+window.addEventListener('error', e => error('global-error', e));
+window.addEventListener('unhandledrejection', e => error('unhandled-rejection', e));
+
+(async () => {
+  try {
+    log('module-start');
+    const { encode, decode } = await import('https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/+esm');
+    log('msgpack-imported');
+    const enc = encode;
+    const dec = decode;
+    const url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host;
+    log('ws-constructing ' + url);
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    log('ws-constructed');
+    ws.onopen = () => {
+      log('ws-open');
+      log('sending Init');
+      ws.send(enc({ etype: 'Init' }));
+    };
+    ws.onmessage = async ev => {
+      log('ws-onmessage ' + typeof ev.data + ' ' + (ev.data instanceof ArrayBuffer));
+      if (!(ev.data instanceof ArrayBuffer)) {
+        log('ws-onmessage-nonbinary');
+        return;
+      }
+      try {
+        const preview = dec(new Uint8Array(ev.data.slice(0, 120)));
+        log('raw-preview ' + JSON.stringify(preview).slice(0, 500));
+      } catch (e) {
+        error('raw-preview-failed', e);
+      }
+      try {
+        const msg = dec(new Uint8Array(ev.data));
+        const frames = Array.isArray(msg) ? msg : [msg];
+        log('process-frames ' + frames.length);
+        for (const item of frames) {
+          if (!item || typeof item !== 'object') {
+            log('skip-nonobject');
+            continue;
+          }
+          log('event ' + item.etype + ' keys=' + Object.keys(item.data || {}));
+          if (item.etype === 'UPSERT') {
+            const nodes = item.data && item.data.nodes;
+            log('upsert-nodes ' + (Array.isArray(nodes) ? nodes.length : typeof nodes));
+            if (Array.isArray(nodes)) {
+              for (const node of nodes) {
+                log('handleEl ' + (node._type || '') + ' ' + (node._key || '') + ' keys=' + Object.keys(node));
+                if (node._type === 'WebRTCVideoPlane' || node._type === 'WebRTCStereoVideoPlane' || node.src) {
+                  log('video-plane ' + (node._type || '') + ' src=' + (node.src || '') + ' aspect=' + (node.aspect || '') + ' height=' + (node.height || ''));
+                }
+              }
+            }
+          }
+        }
+        log('process-ok');
+      } catch (e) {
+        error('process-error', e);
+      }
+    };
+    ws.onclose = ev => {
+      log('ws-close ' + ev.code + ' ' + ev.reason);
+    };
+    ws.onerror = ev => {
+      error('ws-error', ev);
+    };
+  } catch (e) {
+    error('init-error', e);
+  }
+})();
+</script>
+</body>
+</html>

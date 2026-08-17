@@ -1,0 +1,147 @@
+﻿# ============================================================
+# Remote Deployment docker-compose.yml
+# 用于从 Docker Hub 拉取预构建镜像并启动
+# 使用方法: docker compose -f docker-compose.remote.yml up -d
+# ============================================================
+version: "3.9"
+
+services:
+  # ================================================================
+  # 主遥操作服务（远程镜像）
+  # ================================================================
+  xr-teleoperate:
+    # 使用 Docker Hub 远程镜像
+    image: dopamineillusory/xr-teleoperate:latest
+    container_name: xr-teleoperate
+    restart: unless-stopped
+
+    # GPU 支持 (NVIDIA Container Toolkit)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+        limits:
+          memory: 16G
+          cpus: '8'
+
+    # 环境变量（从 .env 文件加载）
+    environment:
+      # 证书路径（镜像内已包含项目自带证书）
+      - XR_TELEOP_CERT=/workspace/certs/cert.pem
+      - XR_TELEOP_KEY=/workspace/certs/key.pem
+      # 机器人配置
+      - XR_TELEOP_ARM=${XR_TELEOP_ARM:-G1_29}
+      - XR_TELEOP_FREQUENCY=${XR_TELEOP_FREQUENCY:-30.0}
+      - XR_TELEOP_INPUT_MODE=${XR_TELEOP_INPUT_MODE:-controller}
+      - XR_TELEOP_DISPLAY_MODE=${XR_TELEOP_DISPLAY_MODE:-immersive}
+      # 网络配置
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+      - DDS_INTERFACE=${DDS_INTERFACE:-eth0}
+      # 显示配置
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      # NVIDIA 配置
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+
+    # 数据卷挂载
+    volumes:
+      # 持久化录制数据（宿主机目录需提前创建）
+      - ../data:/workspace/data
+      # 日志持久化
+      - ../guidelogs:/workspace/guidelogs
+      # IK 缓存加速（只读）
+      - ../g1_29_model_cache.pkl:/workspace/g1_29_model_cache.pkl:ro
+      # 相机配置文件（只读，需从宿主机提供）
+      - ../teleop/teleimager/cam_config_server.yaml:/workspace/teleop/teleimager/cam_config_server.yaml:ro
+      # X11 / Wayland 显示转发
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # 共享内存 (IPC 性能关键)
+      - /dev/shm:/dev/shm
+      # USB 摄像头访问
+      - /dev/bus/usb:/dev/bus/usb
+      # NVIDIA 驱动
+      - /usr/local/nvidia:/usr/local/nvidia:ro
+
+    # 网络模式：host 模式确保最低延迟（DDS + WebRTC）
+    network_mode: host
+
+    # 特权模式（用于访问 USB 摄像头和 DDS）
+    privileged: true
+
+    # 安全选项
+    security_opt:
+      - seccomp:unconfined
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "bash", "/workspace/scripts/docker_healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # 遥操作启动命令（controller 模式 + motion + static-dashboard）
+    command: >
+      python teleop/teleop_hand_and_arm.py
+        --arm ${XR_TELEOP_ARM}
+        --input-mode ${XR_TELEOP_INPUT_MODE}
+        --display-mode ${XR_TELEOP_DISPLAY_MODE}
+        --network-interface ${DDS_INTERFACE}
+        --img-server-ip ${IMG_SERVER_IP}
+        --motion
+        --static-dashboard
+
+  # ================================================================
+  # 图像服务（必选服务 - teleimager）
+  # 远程镜像，与 xr-teleoperate 同机部署
+  # ================================================================
+  teleimager:
+    # 使用 Docker Hub 远程镜像
+    image: dopamineillusory/teleimager:latest
+    container_name: teleimager
+    restart: unless-stopped
+
+    environment:
+      # 证书路径（镜像内已包含项目自带证书）
+      - XR_TELEOP_CERT=/workspace/certs/cert.pem
+      - XR_TELEOP_KEY=/workspace/certs/key.pem
+      - DISPLAY=${DISPLAY:-:0}
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+
+    volumes:
+      # 相机配置（只读，需从宿主机提供）
+      - ../teleop/teleimager/cam_config_server.yaml:/workspace/teleop/teleimager/cam_config_server.yaml:ro
+      - ../teleop/teleimager/cam_config_server_opencv.yaml:/workspace/teleop/teleimager/cam_config_server_opencv.yaml:ro
+      - ../teleop/teleimager/cam_config_server_realsense.yaml:/workspace/teleop/teleimager/cam_config_server_realsense.yaml:ro
+      # 数据持久化
+      - teleimager-data:/workspace/data
+      # USB 摄像头
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev/video0:/dev/video0
+      # X11 转发
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    # 同一台宿主机，使用 host 网络模式
+    network_mode: host
+
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+
+    command: >
+      bash -c "
+        echo '123' | sudo -S modprobe -r uvcvideo || true &&
+        echo '123' | sudo -S modprobe uvcvideo debug=0 &&
+        teleimager-server --rs
+      "
+
+# ================================================================
+# 命名卷
+# ================================================================
+volumes:
+  teleimager-data:
+    driver: local

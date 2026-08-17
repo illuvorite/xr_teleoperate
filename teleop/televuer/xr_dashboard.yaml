@@ -1,0 +1,23 @@
+dashboard:
+  enabled: true
+  static_url_prefix: /static
+
+robot_model:
+  enabled: true
+  urdf: g1/g1_body29_hand14.urdf
+  position: [-0.9, 0.0, -2.4]
+  rotation: [0.0, 0.0, 0.0]
+  scale: 0.65
+  material_type: standard
+
+camera_screen:
+  enabled: true
+  position: [0.0, 1.4, -2.6]
+  rotation: [0.0, 0.0, 0.0]
+  height: 3.4
+  distance: 2.0
+
+status_panel:
+  enabled: true
+  position: [-1.9, 1.1, -2.2]
+  scale: 0.55
