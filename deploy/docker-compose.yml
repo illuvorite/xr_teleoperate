@@ -33,7 +33,7 @@ services:
       - XR_TELEOP_FREQUENCY=${XR_TELEOP_FREQUENCY:-30.0}
       - XR_TELEOP_INPUT_MODE=${XR_TELEOP_INPUT_MODE:-controller}
       - XR_TELEOP_DISPLAY_MODE=${XR_TELEOP_DISPLAY_MODE:-immersive}
-      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-auto}
       - DDS_INTERFACE=${DDS_INTERFACE:-eth0}
       - DISPLAY=${DISPLAY:-:0}
       - QT_X11_NO_MITSHM=1
@@ -107,7 +107,7 @@ services:
       - XR_TELEOP_CERT=/workspace/certs/cert.pem
       - XR_TELEOP_KEY=/workspace/certs/key.pem
       - DISPLAY=${DISPLAY:-:0}
-      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-auto}
 
     volumes:
       # 使用项目自带证书

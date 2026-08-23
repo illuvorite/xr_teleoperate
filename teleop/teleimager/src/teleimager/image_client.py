@@ -30,6 +30,7 @@ import yaml
 import os
 from collections import deque
 import logging_mp
+from teleop.utils.ip_utils import resolve_img_server_ip
 logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
@@ -675,7 +676,7 @@ class ZMQ_Requester:
 # image client
 # ========================================================
 class ImageClient:
-    def __init__(self, host="192.168.123.164", request_port=60000, request_bgr: bool = False,
+    def __init__(self, host="auto", request_port=60000, request_bgr: bool = False,
                  subscribe_zmq: bool = True):
         """
         Args:
@@ -684,6 +685,7 @@ class ImageClient:
             request_bgr:      Whether to request BGR decoding for subscribers
             subscribe_zmq:    Whether to start local ZMQ subscriber threads
         """
+        host = resolve_img_server_ip(host)
         self._host = host
         self._request_port = request_port
         self._request_bgr = request_bgr
@@ -731,7 +733,7 @@ def main():
     # command line args
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--host', type=str, default='192.168.123.164', help='IP address of image server')
+    parser.add_argument('--host', type=str, default='auto', help='IP address of image server (use "auto" to detect)')
     args = parser.parse_args()
 
     # Example usage with three camera streams

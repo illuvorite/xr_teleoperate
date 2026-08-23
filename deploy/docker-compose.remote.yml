@@ -38,7 +38,7 @@ services:
       - XR_TELEOP_INPUT_MODE=${XR_TELEOP_INPUT_MODE:-controller}
       - XR_TELEOP_DISPLAY_MODE=${XR_TELEOP_DISPLAY_MODE:-immersive}
       # 网络配置
-      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-auto}
       - DDS_INTERFACE=${DDS_INTERFACE:-eth0}
       # 显示配置
       - DISPLAY=${DISPLAY:-:0}
@@ -110,7 +110,7 @@ services:
       - XR_TELEOP_CERT=/workspace/certs/cert.pem
       - XR_TELEOP_KEY=/workspace/certs/key.pem
       - DISPLAY=${DISPLAY:-:0}
-      - IMG_SERVER_IP=${IMG_SERVER_IP:-192.168.2.203}
+      - IMG_SERVER_IP=${IMG_SERVER_IP:-auto}
 
     volumes:
       # 相机配置（只读，需从宿主机提供）

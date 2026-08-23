@@ -40,6 +40,7 @@ def run_test_TeleVuer(args):
     display_config = load_display_config(args.display_config)
     use_hand_track = args.input_mode == "hand"
     use_webrtc = args.transport == "webrtc"
+    img_server_ip = resolve_img_server_ip(args.img_server_ip)
     dashboard_config = None
     assets_root = None
     if args.static_dashboard:
@@ -53,7 +54,7 @@ def run_test_TeleVuer(args):
     from televuer import TeleVuer
     from teleimager.image_client import ImageClient
     img_client = ImageClient(
-        host=args.img_server_ip,
+        host=img_server_ip,
         request_bgr=not use_webrtc,
         subscribe_zmq=not use_webrtc,
     )
@@ -72,7 +73,7 @@ def run_test_TeleVuer(args):
         display_mode=args.display_mode,
         zmq=not use_webrtc,
         webrtc=use_webrtc,
-        webrtc_url=f"https://{args.img_server_ip}:{head_config['webrtc_port']}/offer",
+        webrtc_url=f"https://{img_server_ip}:{head_config['webrtc_port']}/offer",
         webrtc_immersive_height=display_config["immersive"]["video_height"],
         webrtc_ego_height=display_config["ego"]["video_height"],
         webrtc_immersive_distance=display_config["immersive"]["video_distance"],
@@ -87,7 +88,7 @@ def run_test_TeleVuer(args):
             args.transport,
             args.display_mode,
             "static" if args.static_dashboard else "off",
-            args.img_server_ip,
+            img_server_ip,
             display_config[args.display_mode] if args.display_mode in ("immersive", "ego") else "pass-through",
         )
         if not args.static_dashboard:
@@ -118,7 +119,7 @@ def run_test_TeleVuer(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the TeleVuer XR camera test.")
-    parser.add_argument("--img-server-ip", default="192.168.2.203")
+    parser.add_argument("--img-server-ip", default="auto", help="IP address of image server. Use 'auto' to detect automatically.")
     parser.add_argument("--transport", choices=["webrtc", "zmq"], default="webrtc")
     parser.add_argument("--display-mode", choices=["immersive", "ego", "pass-through"], default="immersive")
     parser.add_argument("--input-mode", choices=["controller", "hand"], default="controller")

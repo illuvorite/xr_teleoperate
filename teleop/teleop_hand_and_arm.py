@@ -21,6 +21,7 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.ip_utils import resolve_img_server_ip
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -79,7 +80,7 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
-    parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
+    parser.add_argument('--img-server-ip', type=str, default='auto', help='IP address of image server, used by teleimager and televuer. Use "auto" to detect the current robot IP automatically.')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # dashboard
     parser.add_argument('--static-dashboard', action='store_true', help='Enable static dashboard with robot model and status panel (requires immersive + webrtc)')
@@ -100,6 +101,8 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    args.img_server_ip = resolve_img_server_ip(args.img_server_ip, args.network_interface)
+    logger_mp.info(f"[ip] img_server_ip resolved to: {args.img_server_ip}")
     logger_mp.info(f"args: {args}")
 
     try:
