@@ -1,4 +1,5 @@
 import time
+import yaml
 import argparse
 from multiprocessing import Value, Array, Lock
 import threading
@@ -20,6 +21,7 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.ip_utils import resolve_img_server_ip
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -78,8 +80,12 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
-    parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
+    parser.add_argument('--img-server-ip', type=str, default='auto', help='IP address of image server, used by teleimager and televuer. Use "auto" to detect the current robot IP automatically.')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    # dashboard
+    parser.add_argument('--static-dashboard', action='store_true', help='Enable static dashboard with robot model and status panel (requires immersive + webrtc)')
+    parser.add_argument('--dashboard-config', type=str, default=None, help='Path to dashboard YAML config file')
+    parser.add_argument('--assets-root', type=str, default=None, help='Directory containing URDF and mesh assets')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
@@ -95,6 +101,8 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    args.img_server_ip = resolve_img_server_ip(args.img_server_ip, args.network_interface)
+    logger_mp.info(f"[ip] img_server_ip resolved to: {args.img_server_ip}")
     logger_mp.info(f"args: {args}")
 
     try:
@@ -122,7 +130,26 @@ if __name__ == '__main__':
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
+        dashboard_config = None
+        assets_root = None
+        if args.static_dashboard:
+            if args.display_mode != 'immersive':
+                raise ValueError('Static dashboard supports only --display-mode immersive.')
+            if not camera_config['head_camera']['enable_webrtc']:
+                raise ValueError('Static dashboard requires webrtc enabled in camera config.')
+            dashboard_path = args.dashboard_config or os.path.join(current_dir, 'televuer', 'xr_dashboard.yaml')
+            with open(dashboard_path, 'r', encoding='utf-8') as f:
+                dashboard_config = yaml.safe_load(f) or {}
+            assets_root = args.assets_root or os.path.abspath(os.path.join(current_dir, '..', 'assets'))
+
+        stereo_split = camera_config['head_camera'].get('stereo_split_webrtc', False)
+        if stereo_split:
+            webrtc_url_left = f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port_left']}/offer"
+            webrtc_url_right = f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port_right']}/offer"
+        else:
+            webrtc_url_left = webrtc_url_right = f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer"
+
+        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand",
                                      binocular=camera_config['head_camera']['binocular'],
                                      img_shape=camera_config['head_camera']['image_shape'],
                                      # maybe should decrease fps for better performance?
@@ -131,7 +158,12 @@ if __name__ == '__main__':
                                      display_mode=args.display_mode,
                                      zmq=camera_config['head_camera']['enable_zmq'],
                                      webrtc=camera_config['head_camera']['enable_webrtc'],
-                                     webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                     webrtc_url=webrtc_url_left,
+                                     webrtc_url_left=webrtc_url_left,
+                                     webrtc_url_right=webrtc_url_right,
+                                     stereo_split_webrtc=stereo_split,
+                                     static_root=assets_root,
+                                     dashboard=dashboard_config,
                                      )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)

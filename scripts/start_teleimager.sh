@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate tv
+echo "[teleimager] activated conda env: ${CONDA_DEFAULT_ENV:-unknown}"
+
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
+
+export XR_TELEOP_CERT="${XR_TELEOP_CERT:-${HOME}/.config/xr_teleoperate/cert.pem}"
+export XR_TELEOP_KEY="${XR_TELEOP_KEY:-${HOME}/.config/xr_teleoperate/key.pem}"
+
+if command -v sudo >/dev/null 2>&1; then
+  sudo modprobe -r uvcvideo || true
+  sudo modprobe uvcvideo debug=0
+fi
+
+if command -v v4l2-ctl >/dev/null 2>&1 && [ -e /dev/video0 ]; then
+  sudo v4l2-ctl --device=/dev/video0 \
+    --set-fmt-video=width=4000,height=1200,pixelformat=MJPG \
+    --set-parm=30
+fi
+
+# The image server reloads uvcvideo and opens the camera using the driver's
+# default mode. Do not run v4l2-ctl here as a normal user; it may fail with
+# permission errors and leave the device in an invalid format.
+exec teleimager-server 

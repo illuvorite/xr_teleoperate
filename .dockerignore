@@ -1,0 +1,14 @@
+# Docker 构建上下文排除(避免把大文件/无关文件打进镜像)
+# 注意:不要排除 *.pkl —— g1_29_model_cache.pkl 是 IK 缓存,运行时要用
+.git
+**/.git
+**/node_modules
+**/__pycache__
+**/*.pyc
+.kilo
+*.log
+data/
+guidelogs/
+img/
+docs/
+dist/
