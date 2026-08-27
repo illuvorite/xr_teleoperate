@@ -75,7 +75,7 @@ def get_state() -> dict:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
+    parser.add_argument('--frequency', type=float, default=30.0, help='control and record frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
@@ -101,6 +101,8 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.frequency <= 0.0:
+        parser.error('--frequency must be greater than zero')
     args.img_server_ip = resolve_img_server_ip(args.img_server_ip, args.network_interface)
     logger_mp.info(f"[ip] img_server_ip resolved to: {args.img_server_ip}")
     logger_mp.info(f"args: {args}")
@@ -288,9 +290,16 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
-        # main loop. robot start to follow VR user's motion
+        # Keep an absolute schedule so work duration does not accumulate into
+        # additional latency when a cycle overruns.
+        control_period = 1.0 / args.frequency
+        next_control_tick = time.monotonic()
+        last_perf_log = next_control_tick
+        cycle_count = 0
+        overrun_count = 0
         while not STOP:
-            start_time = time.time()
+            cycle_start = time.monotonic()
+            cycle_count += 1
             # get image
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
@@ -357,10 +366,11 @@ if __name__ == '__main__':
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
-            time_ik_start = time.time()
+            time_ik_start = time.monotonic()
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
-            time_ik_end = time.time()
-            logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+            time_ik_end = time.monotonic()
+            ik_elapsed = time_ik_end - time_ik_start
+            logger_mp.debug(f"ik:\t{ik_elapsed:.6f}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             # record data
@@ -504,11 +514,25 @@ if __name__ == '__main__':
                     else:
                         recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
 
-            current_time = time.time()
-            time_elapsed = current_time - start_time
-            sleep_time = max(0, (1 / args.frequency) - time_elapsed)
-            time.sleep(sleep_time)
-            logger_mp.debug(f"main process sleep: {sleep_time}")
+            work_elapsed = time.monotonic() - cycle_start
+            next_control_tick += control_period
+            remaining = next_control_tick - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(remaining)
+            else:
+                overrun_count += 1
+                next_control_tick = time.monotonic()
+
+            now = time.monotonic()
+            if now - last_perf_log >= 1.0:
+                logger_mp.info(
+                    "control_perf: cycles=%d overruns=%d last_cycle=%.3fms ik=%.3fms",
+                    cycle_count,
+                    overrun_count,
+                    work_elapsed * 1000.0,
+                    ik_elapsed * 1000.0,
+                )
+                last_perf_log = now
 
     except KeyboardInterrupt:
         logger_mp.info("⛔ KeyboardInterrupt, exiting program...")

@@ -28,6 +28,4 @@ fi
 # The image server reloads uvcvideo and opens the camera using the driver's
 # default mode. Do not run v4l2-ctl here as a normal user; it may fail with
 # permission errors and leave the device in an invalid format.
-export LD_PRELOAD="${CONDA_PREFIX}/lib/libgomp.so.1"
-export GI_TYPELIB_PATH=/usr/lib/aarch64-linux-gnu/girepository-1.0
 exec teleimager-server --no-affinity

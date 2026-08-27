@@ -1,0 +1,278 @@
+09:18:13.082237 INFO     [ip] img_server_ip resolved  teleop_hand_and_arm.py:107
+                         to: 192.168.2.203                                      
+Exception in thread Thread-1 (listen_keyboard):
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
+    self.run()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/threading.py", line 953, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/sshkeyboard/__init__.py", line 235, in listen_keyboard
+    asyncio.run(coro)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+09:18:13.082805 INFO     args:                        teleop_hand_and_arm.py:108
+                         Namespace(frequency=30.0,                              
+                         input_mode='controller',                               
+                         display_mode='immersive',                              
+                         arm='G1_29', ee=None,                                  
+                         img_server_ip='192.168.2.203                           
+                         ', network_interface='eth0',                           
+                         static_dashboard=False,                                
+                         dashboard_config=None,                                 
+                         assets_root=None,                                      
+                         motion=True, headless=False,                           
+                         sim=False, ipc=False,                                  
+                         affinity=False,                                        
+                         record=False,                                          
+                         task_dir='./utils/data/',                              
+                         task_name='pick cube',                                 
+                         task_goal='pick up cube.',                             
+                         task_desc='task                                        
+                         description',                                          
+                         task_steps='step1: do this;                            
+                         step2: do that;')                                      
+09:18:13.103443 INFO     Received camera config from server  image_client.py:639
+                         192.168.2.203:60000                                    
+    return future.result()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/sshkeyboard/__init__.py", line 343, in listen_keyboard_manual
+    with _raw(sys.stdin), _nonblocking(sys.stdin):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/contextlib.py", line 135, in __enter__
+09:18:13.109283 INFO     Saved camera config to local        image_client.py:642
+                         /home/unitree/xr_teleoperate-main/t                    
+                         eleop/teleimager/cam_config_client.                    
+                         yaml                                                   
+    return next(self.gen)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/sshkeyboard/__init__.py", line 455, in _raw
+    original_stty = termios.tcgetattr(stream)
+termios.error: (25, 'Inappropriate ioctl for device')
+09:18:13.935456 INFO     [G1_29_ArmIK] >>> Loading cached     robot_arm_ik.py:34
+                         robot model: g1_29_model_cache.pkl                     
+09:18:13.980383 INFO     Initialize G1_29_ArmController...       robot_arm.py:63
+09:18:14.308549 WARNING  [G1_29_ArmController] Waiting to        robot_arm.py:99
+                         subscribe dds...                                       
+09:18:14.308973 INFO     [G1_29_ArmController] Subscribe dds    robot_arm.py:100
+                         ok.                                                    
+09:18:14.313732 INFO     Lock all joints except two arms...     robot_arm.py:111
+09:18:14.314447 INFO     Lock OK!                               robot_arm.py:131
+09:18:14.316319 INFO     Initialize G1_29_ArmController OK!     robot_arm.py:139
+09:18:14.316832 INFO     ---------------------------- teleop_hand_and_arm.py:276
+                         ----------------------------                           
+                         --------                                               
+09:18:14.317102 INFO     🟢  Press [r] to start       teleop_hand_and_arm.py:277
+                         syncing the robot with your                            
+                         movements.                                             
+09:18:14.317250 INFO     🔵  Recording is DISABLED    teleop_hand_and_arm.py:281
+                         (run with --record to                                  
+                         enable).                                               
+09:18:14.317362 INFO     🔴  Press [q] to stop and    teleop_hand_and_arm.py:282
+                         exit the program.                                      
+09:18:14.317646 INFO     ⚠️  IMPORTANT: Please keep   teleop_hand_and_arm.py:283
+                         your distance and stay safe.                           
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+protocol.resume_writing() failed
+protocol: <asyncio.sslproto.SSLProtocol object at 0xffff6c1b4c40>
+transport: <_SelectorSocketTransport fd=44 read=polling write=<polling, bufsize=0>>
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/transports.py", line 300, in _maybe_resume_protocol
+    self._protocol.resume_writing()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/sslproto.py", line 522, in resume_writing
+    self._app_protocol.resume_writing()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/base_protocol.py", line 37, in resume_writing
+    assert self._paused
+AssertionError
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+09:31:53.132038 INFO     [ip] img_server_ip resolved  teleop_hand_and_arm.py:107
+                         to: 192.168.2.203                                      
+Exception in thread Thread-1 (listen_keyboard):
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
+    self.run()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/threading.py", line 953, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/sshkeyboard/__init__.py", line 235, in listen_keyboard
+    asyncio.run(coro)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/sshkeyboard/__init__.py", line 343, in listen_keyboard_manual
+    with _raw(sys.stdin), _nonblocking(sys.stdin):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/contextlib.py", line 135, in __enter__
+09:31:53.132520 INFO     args:                        teleop_hand_and_arm.py:108
+                         Namespace(frequency=30.0,                              
+                         input_mode='controller',                               
+                         display_mode='immersive',                              
+                         arm='G1_29', ee=None,                                  
+                         img_server_ip='192.168.2.203                           
+                         ', network_interface='eth0',                           
+                         static_dashboard=False,                                
+                         dashboard_config=None,                                 
+                         assets_root=None,                                      
+                         motion=True, headless=False,                           
+                         sim=False, ipc=False,                                  
+                         affinity=False,                                        
+                         record=False,                                          
+                         task_dir='./utils/data/',                              
+                         task_name='pick cube',                                 
+                         task_goal='pick up cube.',                             
+                         task_desc='task                                        
+                         description',                                          
+                         task_steps='step1: do this;                            
+                         step2: do that;')                                      
+    return next(self.gen)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/sshkeyboard/__init__.py", line 455, in _raw
+09:31:53.152029 INFO     Received camera config from server  image_client.py:639
+                         192.168.2.203:60000                                    
+    original_stty = termios.tcgetattr(stream)
+termios.error: (25, 'Inappropriate ioctl for device')
+09:31:53.157997 INFO     Saved camera config to local        image_client.py:642
+                         /home/unitree/xr_teleoperate-main/t                    
+                         eleop/teleimager/cam_config_client.                    
+                         yaml                                                   
+09:31:53.980559 INFO     [G1_29_ArmIK] >>> Loading cached     robot_arm_ik.py:34
+                         robot model: g1_29_model_cache.pkl                     
+09:31:54.010249 INFO     Initialize G1_29_ArmController...       robot_arm.py:63
+09:31:54.349644 WARNING  [G1_29_ArmController] Waiting to        robot_arm.py:99
+                         subscribe dds...                                       
+09:31:54.353658 INFO     [G1_29_ArmController] Subscribe dds    robot_arm.py:100
+                         ok.                                                    
+09:31:54.359277 INFO     Lock all joints except two arms...     robot_arm.py:111
+09:31:54.360032 INFO     Lock OK!                               robot_arm.py:131
+09:31:54.362367 INFO     Initialize G1_29_ArmController OK!     robot_arm.py:139
+09:31:54.362660 INFO     ---------------------------- teleop_hand_and_arm.py:276
+                         ----------------------------                           
+                         --------                                               
+09:31:54.362808 INFO     🟢  Press [r] to start       teleop_hand_and_arm.py:277
+                         syncing the robot with your                            
+                         movements.                                             
+09:31:54.362915 INFO     🔵  Recording is DISABLED    teleop_hand_and_arm.py:281
+                         (run with --record to                                  
+                         enable).                                               
+09:31:54.363013 INFO     🔴  Press [q] to stop and    teleop_hand_and_arm.py:282
+                         exit the program.                                      
+09:31:54.363107 INFO     ⚠️  IMPORTANT: Please keep   teleop_hand_and_arm.py:283
+                         your distance and stay safe.                           
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Unhandled exception
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/base_events.py", line 1208, in _sendfile_fallback
+    await proto.drain()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/base_events.py", line 227, in drain
+    raise ConnectionError("Connection closed by peer")
+ConnectionError: Connection closed by peer
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 560, in start
+    resp, reset = await task
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 502, in _handle_request
+    resp, reset = await self.finish_response(request, resp, start_time)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 668, in finish_response
+    await prepare_meth(request)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_fileresponse.py", line 362, in prepare
+    return await self._sendfile(request, fobj, offset, count)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_fileresponse.py", line 131, in _sendfile
+    await loop.sendfile(transport, fobj, offset, count)
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/base_events.py", line 1184, in sendfile
+    return await self._sendfile_fallback(transport, file,
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/base_events.py", line 1214, in _sendfile_fallback
+    await proto.restore()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/base_events.py", line 268, in restore
+    self._transport.resume_reading()
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/asyncio/sslproto.py", line 343, in resume_reading
+    self._ssl_protocol._transport.resume_reading()
+AttributeError: 'NoneType' object has no attribute 'resume_reading'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'
+Missing return statement on request handler
+Traceback (most recent call last):
+  File "/home/unitree/miniconda3/envs/tv/lib/python3.10/site-packages/aiohttp/web_protocol.py", line 653, in finish_response
+    prepare_meth = resp.prepare
+AttributeError: 'NoneType' object has no attribute 'prepare'

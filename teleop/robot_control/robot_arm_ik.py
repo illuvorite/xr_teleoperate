@@ -152,7 +152,9 @@ class G1_29_ArmIK:
             self.var_q,
             self.reduced_robot.model.upperPositionLimit)
         )
-        self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        # Prefer the previous feasible configuration when multiple IK branches
+        # satisfy the same end-effector pose.
+        self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.002 * self.regularization_cost + 0.5 * self.smooth_cost)
 
         opts = {
             # CasADi-level options
@@ -176,6 +178,13 @@ class G1_29_ArmIK:
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
         self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
+        self.last_diagnostics = {
+            "min_limit_margin": float("nan"),
+            "jacobian_sigma_min": float("nan"),
+            "joint_step_max": float("nan"),
+            "solver_ok": False,
+        }
+        self._last_diagnostic_log = 0.0
         self.vis = None
 
         if self.Visualization:
@@ -268,6 +277,7 @@ class G1_29_ArmIK:
             sol_q = self.opti.value(self.var_q)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
+            self._update_diagnostics(sol_q, solver_ok=True)
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -289,6 +299,7 @@ class G1_29_ArmIK:
             sol_q = self.opti.debug.value(self.var_q)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
+            self._update_diagnostics(sol_q, solver_ok=False)
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -305,7 +316,52 @@ class G1_29_ArmIK:
 
             # return sol_q, sol_tauff
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
-        
+
+    def _update_diagnostics(self, q, solver_ok):
+        """Capture safety indicators without changing the control API."""
+        lower = np.asarray(self.reduced_robot.model.lowerPositionLimit)
+        upper = np.asarray(self.reduced_robot.model.upperPositionLimit)
+        q = np.asarray(q)
+        margin = np.minimum(q - lower, upper - q)
+
+        try:
+            left_jacobian = pin.computeFrameJacobian(
+                self.reduced_robot.model,
+                self.reduced_robot.data,
+                q,
+                self.L_hand_id,
+                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )
+            left_sigma_min = np.linalg.svd(left_jacobian, compute_uv=False)[-1]
+            right_jacobian = pin.computeFrameJacobian(
+                self.reduced_robot.model,
+                self.reduced_robot.data,
+                q,
+                self.R_hand_id,
+                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )
+            right_sigma_min = np.linalg.svd(right_jacobian, compute_uv=False)[-1]
+            sigma_min = min(left_sigma_min, right_sigma_min)
+        except Exception:
+            sigma_min = float("nan")
+
+        self.last_diagnostics = {
+            "min_limit_margin": float(np.min(margin)),
+            "jacobian_sigma_min": float(sigma_min),
+            "joint_step_max": float(np.max(np.abs(q - self.init_data))),
+            "solver_ok": bool(solver_ok),
+        }
+        now = time.monotonic()
+        if now - self._last_diagnostic_log >= 1.0:
+            logger_mp.info(
+                "ik_diag: ok=%s limit_margin=%.4frad sigma_min=%.5f joint_step=%.4frad",
+                solver_ok,
+                self.last_diagnostics["min_limit_margin"],
+                self.last_diagnostics["jacobian_sigma_min"],
+                self.last_diagnostics["joint_step_max"],
+            )
+            self._last_diagnostic_log = now
+
 class G1_23_ArmIK:
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
