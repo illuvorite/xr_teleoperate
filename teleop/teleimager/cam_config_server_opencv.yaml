@@ -5,8 +5,15 @@ head_camera:
   webrtc_port: 60001
   webrtc_codec: h264
   type: opencv
-  image_shape: [480, 1280]
+  # Keep a cropped side-by-side frame for Pico's stereo-left-right VR layout.
+  capture_image_shape: [480, 1280]
+  image_shape: [480, 960]
   binocular: true
+  stereo_sbs: true
+  stereo_fusion: false
+  stereo_crop_left: 160
+  stereo_blend_alpha: 0.5
+  stereo_right_shift_x: 0
   fps: 30
   video_id: 2
   serial_number: null

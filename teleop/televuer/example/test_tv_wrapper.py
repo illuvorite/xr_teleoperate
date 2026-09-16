@@ -6,6 +6,7 @@ if project_root not in sys.path:
 
 import time
 from televuer import TeleVuerWrapper
+from teleop.utils.ip_utils import detect_local_ip
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
@@ -16,7 +17,7 @@ def run_test_tv_wrapper():
 
     # teleimager, if you want to test real image streaming, make sure teleimager server is running
     from teleimager.image_client import ImageClient
-    img_client = ImageClient(host="192.168.123.164")
+    img_client = ImageClient(host="auto")
     camera_config = img_client.get_cam_config()
     # teleimager + televuer
     tv_wrapper = TeleVuerWrapper(use_hand_tracking=use_hand_track, 
@@ -26,7 +27,7 @@ def run_test_tv_wrapper():
                                 display_fps=camera_config['head_camera']['fps'],
                                 zmq=camera_config['head_camera']['enable_zmq'],
                                 webrtc=camera_config['head_camera']['enable_webrtc'],
-                                webrtc_url=f"https://192.168.123.164:{camera_config['head_camera']['webrtc_port']}/offer"
+                                webrtc_url=f"https://{detect_local_ip()}:{camera_config['head_camera']['webrtc_port']}/offer"
                                 )
     # pure televuer
     # tv_wrapper = TeleVuerWrapper(use_hand_tracking=use_hand_track, 

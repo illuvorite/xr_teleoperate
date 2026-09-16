@@ -23,4 +23,9 @@ teleop/data/
 episode_0*
 .vscode/
 *.pkl
-*.bak
+# 保留 vendor 目录结构（相机 SDK + 运行时库）
+!teleop/teleimager/vendor/
+!teleop/teleimager/vendor/camera_sdk_test/build/*.so
+!teleop/teleimager/vendor/camera_sdk_test/build/libsyncsdk_*.so
+!teleop/teleimager/vendor/glibc235/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+!teleop/teleimager/vendor/glibc235/lib/aarch64-linux-gnu/libc.so.6

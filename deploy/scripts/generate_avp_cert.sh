@@ -39,10 +39,20 @@ cat > server_ext.cnf <<EOF
 subjectAltName = @alt_names
 [alt_names]
 DNS.1 = localhost
-IP.1 = ${HOST_IP}
-IP.2 = 192.168.123.2
-IP.3 = 192.168.123.164
 EOF
+
+# 添加主 IP
+echo "IP.1 = ${HOST_IP}" >> server_ext.cnf
+echo "[avp-cert] Adding IP to SAN: ${HOST_IP}"
+
+# 收集其他非回环 IP（避免硬编码旧 IP）
+OTHER_IPS=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | grep -v "^${HOST_IP}$" || true)
+i=2
+for ip in $OTHER_IPS; do
+    echo "IP.$i = $ip" >> server_ext.cnf
+    echo "[avp-cert] Adding IP to SAN: $ip"
+    i=$((i+1))
+done
 
 openssl x509 -req -in server.csr -CA rootCA.pem -CAkey rootCA.key \
     -CAcreateserial -out cert.pem -days 365 -sha256 -extfile server_ext.cnf

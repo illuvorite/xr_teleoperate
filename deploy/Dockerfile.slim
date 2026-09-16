@@ -65,7 +65,7 @@ RUN mkdir -p /workspace/certs /root/.config/xr_teleoperate \
     && ln -sf /workspace/certs/key.pem /root/.config/xr_teleoperate/key.pem
 
 # ---- Install entrypoint script ----
-COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY deploy/scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # ---- Runtime directories ----

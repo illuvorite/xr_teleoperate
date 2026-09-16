@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 3,
+  "name": "xr_teleoperate",
+  "displayName": "XR 遥操作服务（机器人端）",
+  "purpose": "部署在 Unitree G1 上的 XR/VR 遥操作服务，为 Web 控制台提供遥操画面与相机图像流。",
+  "icon": "XR",
+  "defaultDirectory": "/home/unitree/xr_teleoperate/",
+  "version": "1.0.0",
+  "arch": ["arm64"],
+  "type": "python",
+  "description": "XR 遥操作主程序（Unitree G1_29）。部署后注册 xr-teleimager、xr-heartbeat 两个服务；遥操作主程序只允许手动启动。",
+
+  "packageType": "zip",
+  "whitelist": true,
+
+  "buildDate": "REPLACE_WITH_BUILD_DATE_UTC",
+  "buildType": "release",
+  "includeSdk": false,
+  "gitSha": "",
+  "buildArchitecture": "arm64",
+
+  "vendor": "Qingshan Technology",
+  "timestamp": "REPLACE_WITH_UTC_NOW",
+  "applicationInfo": {
+    "sizeBytes": 0,
+    "maintainer": "qingshankeji <support@example.com>",
+    "signerFingerprint": ""
+  },
+
+  "entrypoint": {
+    "command": "./scripts/start_xr_teleop.sh",
+    "workdir": "."
+  },
+
+  "service": {
+    "name": "xr-teleimager",
+    "installScript": "install_service.sh",
+    "manualStartScripts": ["scripts/start_xr_teleop.sh"],
+    "autostart": true
+  },
+
+  "healthCheck": {
+    "type": "process",
+    "pattern": "teleimager",
+    "timeoutSeconds": 60
+  }
+}

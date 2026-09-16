@@ -1,18 +1,71 @@
 head_camera:
-  enable_zmq: true
+  enable_zmq: false
   zmq_port: 55555
   enable_webrtc: true
   webrtc_port: 60001
   webrtc_codec: h264
-  bitrate: 6000000
-  type: realsense
-  image_shape: [720, 1280]
-  binocular: false
-  fps: 15
-  video_id: null
-  serial_number: '349522071964'
-  physical_path: null
-
+  bitrate: 12000000
+  # SCAM SDK 输出已裁掉 160px 编码区：3840x1200 SBS，单眼 1920x1200
+  type: scam
+  # 支持三种方式定位 SDK：
+  # 1) 项目内 vendor 相对路径：vendor/camera_sdk_test/build/libscam.so
+  # 2) 绝对路径
+  # 3) 留空则回退到 CAMERA_SDK_DIR/build/libscam.so 或系统默认路径
+  sdk_library_path: vendor/camera_sdk_test/build/libscam.so
+  device_index: 0
+  output_format: nv12
+  eye_width: 1920
+  eye_height: 1200
+  capture_image_shape: [1200, 3840]
+  image_shape: [720, 2560]
+  binocular: true
+  stereo_sbs: true
+  stereo_fusion: false
+  stereo_crop_left: 0
+  stereo_crop_right: 0
+  stereo_blend_alpha: 0.5
+  stereo_right_shift_x: -5
+  stereo_shift_x: 0
+  stereo_split_webrtc: false
+  webrtc_port_left: 60001
+  webrtc_port_right: 60002
+  fps: 30
+  video_id: 6
+  serial_number: null
+  physical_path: /sys/devices/platform/3610000.xhci/usb2/2-2/2-2.3/2-2.3:1.0
+  # ---------------- IMU 电子防抖（EIS） ----------------
+  stabilization:
+    enabled: true
+    mode: gyro
+    acc_divisor_to_g: 1000
+    axis_map: [0, 1, 2]
+    axis_sign: [-1.0, -1.0, 1.0]   # 待旋转验证：重力实测建议 IMU 相对相机 180° roll
+    exposure_ref: midpoint
+    static_calibration_s: 2.0
+    static_gyro_dps: 0.8
+    smoothing_alpha: 0.5
+    motion_boost: true
+    max_correction_deg: 5.0
+    crop_ratio: 0.06
+    border_mode: replicate
+    imu_gap_reset_ms: 50
+    imu_timeout_bypass_ms: 200
+    # P1.1 ESKF: 当前 axis_sign 未标定, 加计方向与 ESKF 假设不一致
+    # 导致量测更新抵消 bias 修正. 临时关闭, 用 ImuAttitude + relearn_beta
+    use_eskf: false
+    eskf_sigma_g_dps: 0.03
+    eskf_sigma_b_dps: 5e-4
+    eskf_sigma_a_g: 0.5
+    # 零偏缓更新: 加快 EMA 收敛 (原本 0.001 -> 0.01, 10x)
+    relearn_beta: 0.01
+    # P1.3 旋转中心
+    baseline_mm: 64.0
+    use_recenter_to_baseline: true
+    scene_depth_m: 2.0
+    # P1.5 状态机
+    warmup_crop_ratio: 0.0
+    spike_recover_hold_s: 0.2
+    spike_gyro_sat_dps: 200.0
 left_wrist_camera:
   enable_zmq: false
   zmq_port: 55556

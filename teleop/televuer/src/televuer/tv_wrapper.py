@@ -230,7 +230,8 @@ class TeleVuerWrapper:
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None,
                        cert_file: str=None, key_file: str=None, http_mode: bool=False, return_hand_rot_data: bool=False,
                        arm_reference_mode: Literal["head_position", "head_yaw"]="head_yaw",
-                       static_root: str=None, dashboard: dict=None):
+                       static_root: str=None, dashboard: dict=None,
+                       webrtc_url_left: str=None, webrtc_url_right: str=None, stereo_split_webrtc: bool=False):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
@@ -280,6 +281,7 @@ class TeleVuerWrapper:
         self.arm_reference_mode = arm_reference_mode
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url,
+                              webrtc_url_left=webrtc_url_left, webrtc_url_right=webrtc_url_right, stereo_split_webrtc=stereo_split_webrtc,
                               cert_file=cert_file, key_file=key_file, http_mode=http_mode,
                               static_root=static_root, dashboard=dashboard)
         

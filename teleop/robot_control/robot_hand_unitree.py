@@ -406,8 +406,8 @@ if __name__ == "__main__":
 
     ChannelFactoryInitialize(1) # 0 for real robot, 1 for simulation
     
-    # image client
-    img_client = ImageClient(host='127.0.0.1') #host='192.168.123.164'
+    # image client (auto-detect current robot IP)
+    img_client = ImageClient(host='auto')
     if not img_client.has_head_cam():
         logger_mp.error("Head camera is required. Please enable head camera on the image server side.")
     head_img_shape = img_client.get_head_shape()

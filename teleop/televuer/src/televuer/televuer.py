@@ -5,6 +5,8 @@ from multiprocessing import Value, Array, Process, shared_memory
 import numpy as np
 import asyncio
 import json
+import logging
+import math
 import re
 import shutil
 import threading
@@ -14,6 +16,9 @@ import os
 from pathlib import Path
 from typing import Any, Literal
 from xml.etree import ElementTree
+from urllib.parse import urlparse
+
+from teleop.utils import host_info  # noqa: E402  (after stdlib imports)
 
 # Dashboard HUD constants: a glass-card look consistent with the autobot console.
 _DASHBOARD_FONT = "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif"
@@ -44,7 +49,231 @@ _VUER_GRID_DISABLE_RE = re.compile(
     r'\(\(([A-Za-z_$]+)=([A-Za-z_$]+)\.grid\)==null\?void 0:\1\.toLowerCase\(\)\)!==\"false\"'
 )
 
-_PATCHED_CLIENT_MARKER = ".patched-v2"
+# 桌面浏览器里默认视点静止(OrbitControls.autoRotate=false),拖拽才转。
+# 把 OrbitControls 类定义的默认 autoRotate 改成 true:所有实例开启自动环绕,
+# 浏览器不拖拽画面也会自己转动(视点环绕);PICO 或主动拖拽时仍可覆盖。
+# 注入点是类定义的唯一串(three/examples OrbitControls 源码):
+#   Nn(this,"autoRotate",!1),Nn(this,"autoRotateSpeed",2)
+# => Nn(this,"autoRotate",!0),Nn(this,"autoRotateSpeed",1.6)
+_ORBIT_AUTOROTATE_RE = re.compile(
+    r'Nn\(this,"autoRotate",!1\),Nn\(this,"autoRotateSpeed",2\)'
+)
+_ORBIT_AUTOROTATE_REPL = 'Nn(this,"autoRotate",!0),Nn(this,"autoRotateSpeed",1.6)'
+
+# 电量上报注入脚本:让"真实头显直接打开 8012 页面"时,把 PICO 电量经 /ws/aux
+# 推给 televuer,再由 televuer 广播给 autobot 控制台(/proxy/vr/{id}/_aux_ws)。
+#
+# 为什么必须做"非 iframe + 非代理"判断:
+#   autobot 控制台是通过后端反向代理(/proxy/vr/{robotId}/)把该页面嵌进 iframe 的,
+#   那种情况下页面跑在运营人员的电脑浏览器里,若照常上报,控制台会把运营电脑的
+#   电量当成头显电量。因此只在"顶层窗口 + 非 /proxy/vr/ 路径"时才上报。
+#
+# 取电优先级:
+#   1. window.__XR_TELEOP_BATTERY__ —— 可选的外部注入(PICO Web SDK 等),便于
+#      后续在不动本文件的前提下换成厂商接口;
+#   2. navigator.getBattery() —— Battery Status API(Chromium 系浏览器)。
+#   两者都拿不到时不上报(宁可空着,也不要写假数据)。
+_BATTERY_REPORT_JS = r"""
+(() => {
+  if (window.__xrTeleopBatteryInstalled) return;
+  window.__xrTeleopBatteryInstalled = true;
+
+  try {
+    if (window.top !== window.self) return;
+    if (location.pathname.indexOf('/proxy/vr/') === 0) return;
+  } catch (e) { return; }
+
+  const WS_PATH = '/ws/aux';
+  const KEEPALIVE_MS = 20000;
+  const RECONNECT_MAX_MS = 30000;
+
+  let ws = null;
+  let attempt = 0;
+  let keepalive = null;
+  let batteryManager = null;
+
+  function deviceLabel() {
+    const ua = navigator.userAgent || '';
+    const pico = ua.match(/PICO[^;)]*/i);
+    if (pico) return pico[0];
+    if (/quest|oculus/i.test(ua)) return 'Meta Quest';
+    if (/vision ?pro/i.test(ua)) return 'Apple Vision Pro';
+    return 'XR 设备';
+  }
+
+  function snapshot() {
+    const ext = window.__XR_TELEOP_BATTERY__;
+    if (ext && typeof ext.get === 'function') {
+      try {
+        const d = ext.get();
+        if (d && typeof d.level === 'number' && isFinite(d.level)) {
+          return {
+            level: Math.max(0, Math.min(100, Math.round(d.level))),
+            charging: typeof d.charging === 'boolean' ? d.charging : null,
+            deviceName: d.deviceName || deviceLabel(),
+          };
+        }
+      } catch (e) { /* 回落到 navigator.getBattery */ }
+    }
+    if (!batteryManager) return null;
+    const level = Math.round(batteryManager.level * 100);
+    if (!isFinite(level)) return null;
+    return {
+      level: Math.max(0, Math.min(100, level)),
+      charging: !!batteryManager.charging,
+      deviceName: deviceLabel(),
+    };
+  }
+
+  function push(reason) {
+    if (!ws || ws.readyState !== 1) return;
+    const data = snapshot();
+    if (!data) return;
+    data.updatedAt = Date.now();
+    try {
+      ws.send(JSON.stringify({ type: 'battery-update', data: data, reason: reason }));
+    } catch (e) { /* 已断线,等重连 */ }
+  }
+
+  function scheduleReconnect() {
+    const delay = Math.min(1000 * Math.pow(2, attempt), RECONNECT_MAX_MS);
+    attempt += 1;
+    setTimeout(connect, delay);
+  }
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    try {
+      ws = new WebSocket(proto + '//' + location.host + WS_PATH);
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = () => {
+      attempt = 0;
+      push('open');
+      if (keepalive) clearInterval(keepalive);
+      keepalive = setInterval(() => push('tick'), KEEPALIVE_MS);
+    };
+    ws.onclose = () => {
+      if (keepalive) { clearInterval(keepalive); keepalive = null; }
+      scheduleReconnect();
+    };
+  }
+
+  if (navigator.getBattery) {
+    navigator.getBattery().then((bm) => {
+      batteryManager = bm;
+      bm.addEventListener('levelchange', () => push('levelchange'));
+      bm.addEventListener('chargingchange', () => push('chargingchange'));
+      push('init');
+    }).catch(() => {
+      console.warn('[xr-teleop-battery] 读取电池信息失败,电量不会上报。');
+    });
+  } else {
+    console.warn('[xr-teleop-battery] Battery Status API 不可用,电量不会上报。');
+  }
+
+  connect();
+})();
+"""
+
+_PATCHED_CLIENT_MARKER = ".patched-v8"
+
+# 自动视点环绕注入脚本:周期性向 vuer 的 <canvas> 派发微弱 pointer 事件序列,
+# 让原生相机拖拽逻辑以为鼠标在缓慢拖动。用户真实按下时暂停,抬起后恢复。
+# 实现细节:
+#   - 只对 pointer 事件生效,不影响 WebXR(PICO)的控制器输入。
+#   - 每帧(xr cadence)推进一次微小偏移;约 10-20s 完成一整圈,幅度可控。
+#   - 事件用 CanvasPointerEvent 构造,带 clientX/clientY,与真实拖拽一致。
+_AUTO_ORBIT_JS = r"""
+(() => {
+  if (window.__vuerAutoOrbitInstalled) return;
+  window.__vuerAutoOrbitInstalled = true;
+
+  const SPEED = 0.5;      // deg/frame 的视点移动量 (负值反向)
+  const STEP_MS = 100;    // 事件推进间隔(毫秒)
+  let canvas = null;
+  let active = true;      // 全局开关(未发现 canvas 时保持等待)
+
+  function findCanvas() {
+    const c = document.querySelector('canvas');
+    if (c) return c;
+    return null;
+  }
+
+  // 模拟一次"持续拖拽":pointerdown(dx,dy) → n 次 pointermove → pointerup
+  function dispatchPointer(win, type, x, y) {
+    try {
+      const evt = new PointerEvent(type, {
+        bubbles: true, cancelable: true,
+        composed: true,
+        pointerId: 1, pointerType: 'mouse',
+        isPrimary: true,
+        clientX: x, clientY: y,
+        screenX: x, screenY: y,
+        button: type === 'pointerup' ? -1 : 0,
+        buttons: type === 'pointerup' ? 0 : 1,
+      });
+      canvas.dispatchEvent(evt);
+      if (typeof win !== 'undefined' && win.document) {
+        win.document.dispatchEvent(new PointerEvent(type, {
+          bubbles: true, cancelable: true,
+          clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+          button: type === 'pointerup' ? -1 : 0,
+          buttons: type === 'pointerup' ? 0 : 1,
+        }));
+      }
+    } catch (e) { /* noop */ }
+  }
+
+  let userInteracting = false;
+  window.addEventListener('pointerdown', () => { userInteracting = true; }, true);
+  window.addEventListener('pointerup', () => { userInteracting = false; }, true);
+  window.addEventListener('wheel', () => { userInteracting = true; }, true);
+
+  let x = Math.floor(window.innerWidth * 0.2);
+  let y = Math.floor(window.innerHeight * 0.5);
+  let running = false;
+
+  function step() {
+    if (!canvas) {
+      canvas = findCanvas();
+      if (!canvas) { setTimeout(step, 500); return; }
+    }
+    if (userInteracting) { setTimeout(step, STEP_MS); return; }   // 用户操作中,暂停
+    if (!active) { setTimeout(step, STEP_MS); return; }
+
+    // 每个 STEP_MS 产生一次小幅移动的"拖拽"节奏:
+    // 每次: down(i) → move(i + dx) → up —— 形成连续微拖动
+    if (!running) {
+      running = true;
+      dispatchPointer(window, 'pointerdown', x, y);
+      requestAnimationFrame(() => {
+        const dx = Math.cos(performance.now() / 9000) * SPEED;
+        const dy = Math.sin(performance.now() / 9000) * SPEED * 0.8;
+        x += dx; y += dy;
+        dispatchPointer(window, 'pointermove', x, y);
+        dispatchPointer(window, 'pointerup', x, y);
+        running = false;
+      });
+    }
+    setTimeout(step, STEP_MS);
+  }
+
+  setTimeout(step, 800);   // 给 vuer 初始化留出时间
+
+  // 监听环境变量类的开关(可在控制台改):window.__vuerAutoOrbitActive
+  Object.defineProperty(window, '__vuerAutoOrbitActive', {
+    get: () => active,
+    set: (v) => { active = !!v; },
+  });
+})();
+"""
+
+
+def _auto_orbit_enabled_global() -> bool:
+    return os.getenv("XR_TELEOP_AUTO_ORBIT", "1").strip() in ("1", "true", "yes", "on")
 
 
 def _device_type_from_ua(ua: str) -> str:
@@ -68,15 +297,22 @@ def _device_type_from_ua(ua: str) -> str:
 def _patched_client_root() -> Path:
     """Return a patched copy of vuer's client build with client defaults changed.
 
-    Two patches are applied once into a cache directory, without touching the installed
+    Patches are applied once into a cache directory, without touching the installed
     package and without requiring any URL query parameters:
 
       1. the client's default grid plane is disabled (the client otherwise shows it on any
          URL that lacks ``?grid=false``);
-      2. a stylesheet hides the vuer built-in menu/dock (see _VUER_UI_HIDE_CSS).
+      2. a stylesheet hides the vuer built-in menu/dock (see _VUER_UI_HIDE_CSS);
+      3. auto-orbit script so the desktop viewport orbits by itself (see _AUTO_ORBIT_JS);
+      4. battery reporting script that pushes the headset battery to ``/ws/aux``
+         (see _BATTERY_REPORT_JS).
 
     The server is pointed at this copy via ``Vuer.client_root`` before the Vuer instance is
     constructed, so both the root page and the ``/assets`` bundles are served from it.
+
+    .. note::
+       改动任一注入脚本后必须同时提升 ``_PATCHED_CLIENT_MARKER``,否则已存在的
+       ``~/.cache/xr_teleoperate/client_patch`` 会被直接复用,新脚本不会生效。
     """
     original = Path(vuer.__file__).resolve().parent / "client_build"
     patched_dir = Path.home() / ".cache" / "xr_teleoperate" / "client_patch"
@@ -90,8 +326,18 @@ def _patched_client_root() -> Path:
     for js in patched_dir.glob("assets/**/*.js"):
         src = js.read_text(encoding="utf-8", errors="replace")
         patched, count = _VUER_GRID_DISABLE_RE.subn("false", src)
+        if count or patched != src:
+            js.write_text(patched, encoding="utf-8")
+
+    # 1b. Enable OrbitControls.autoRotate by default so the desktop viewport
+    # slowly orbits on its own (no dragging required). Only the chunk bytes
+    # are patched; the marker bump below forces a rebuild of the cache.
+    for js in patched_dir.glob("assets/**/*.js"):
+        src = js.read_text(encoding="utf-8", errors="replace")
+        patched, count = _ORBIT_AUTOROTATE_RE.subn(_ORBIT_AUTOROTATE_REPL, src)
         if count:
             js.write_text(patched, encoding="utf-8")
+            print(f"[televuer] orbit autoRotate patch applied in {js.name} (x{count})")
 
     # 2. Inject the menu-hiding stylesheet into the root page.
     index = patched_dir / "index.html"
@@ -102,9 +348,34 @@ def _patched_client_root() -> Path:
             f'<style id="vuer-ui-hide">{_VUER_UI_HIDE_CSS}</style></head>',
             1,
         )
-        index.write_text(html, encoding="utf-8")
 
-    marker.write_text("v1", encoding="utf-8")
+    # 2b. 桌面浏览器自动视点环绕(auto orbit):vuer 的主相机由鼠标拖拽(pointer
+    # events)驱动,不拖就不动。注入一段小脚本,周期性向 <canvas> 派发微弱
+    # pointermove 序列,让 vuer 的原生拖拽响应"以为鼠标在缓慢拖动"——
+    # 视点自动环绕,无需用户按住。用户真实拖拽时脚本暂停,让出控制权。
+    # 通过 XR_TELEOP_AUTO_ORBIT 环境变量可关闭(默认开启)。
+    if _auto_orbit_enabled_global():
+        auto_orbit_js = _AUTO_ORBIT_JS
+        if "vuer-auto-orbit" not in html:
+            html = html.replace(
+                "</body>",
+                f'<script id="vuer-auto-orbit">{auto_orbit_js}</script></body>',
+                1,
+            )
+
+    # 2c. 电量上报:头显直接打开本页面时,把电量经 /ws/aux 推给本进程,再由本进程
+    #     广播给 autobot 控制台。脚本内部会排除 iframe 嵌入与 /proxy/vr/ 代理访问,
+    #     避免把运营电脑的电量误报成头显电量(详见 _BATTERY_REPORT_JS 注释)。
+    if "xr-teleop-battery" not in html:
+        html = html.replace(
+            "</body>",
+            f'<script id="xr-teleop-battery">{_BATTERY_REPORT_JS}</script></body>',
+            1,
+        )
+
+    index.write_text(html, encoding="utf-8")
+
+    marker.write_text("v4", encoding="utf-8")
     return patched_dir
 
 
@@ -112,9 +383,10 @@ class TeleVuer:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
                         display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None,
                         cert_file: str=None, key_file: str=None, http_mode: bool=False,
-                        webrtc_immersive_height: float=2.2, webrtc_ego_height: float=1.0,
-                        webrtc_immersive_distance: float=1.6, webrtc_ego_distance: float=1.8,
-                        static_root: str | None=None, dashboard: dict[str, Any] | None=None):
+                        webrtc_immersive_height: float=1.8, webrtc_ego_height: float=1.0,
+                        webrtc_immersive_distance: float=2.0, webrtc_ego_distance: float=1.8,
+                        static_root: str | None=None, dashboard: dict[str, Any] | None=None,
+                        webrtc_url_left: str=None, webrtc_url_right: str=None, stereo_split_webrtc: bool=False):
         """
         TeleVuer class for OpenXR-based XR teleoperate applications.
         This class handles the communication with the Vuer server and manages image and pose data.
@@ -169,6 +441,9 @@ class TeleVuer:
         self.zmq = zmq
         self.webrtc = webrtc
         self.webrtc_url = webrtc_url
+        self.webrtc_url_left = webrtc_url_left or webrtc_url
+        self.webrtc_url_right = webrtc_url_right or webrtc_url
+        self.stereo_split_webrtc = stereo_split_webrtc
         self.webrtc_immersive_height = webrtc_immersive_height
         self.webrtc_ego_height = webrtc_ego_height
         self.webrtc_immersive_distance = webrtc_immersive_distance
@@ -203,7 +478,26 @@ class TeleVuer:
                         cert_file = cert_file or str(current_module_dir / "cert.pem")
                         key_file = key_file or str(current_module_dir / "key.pem")
 
-        vuer_kwargs = dict(host='0.0.0.0', cert=cert_file, key=key_file,
+        # Vuer's default URL points to vuer.ai when it runs on port 8012. That
+        # is useful for the hosted client, but a Pico must load the local page
+        # so its relative WebSocket connects to this process. Derive the host
+        # from the WebRTC endpoint and allow an explicit public URL override.
+        public_url = os.getenv("XR_TELEOP_PUBLIC_URL")
+        if public_url:
+            parsed_public_url = urlparse(public_url)
+            public_host = parsed_public_url.hostname
+            public_scheme = parsed_public_url.scheme or "https"
+            public_port = parsed_public_url.port or 8012
+        else:
+            parsed_webrtc_url = urlparse(webrtc_url or "")
+            public_host = parsed_webrtc_url.hostname or os.getenv("XR_TELEOP_PUBLIC_HOST", "127.0.0.1")
+            public_scheme = "https" if cert_file else "http"
+            public_port = 8012
+        if not public_host:
+            raise ValueError("[TeleVuer] XR_TELEOP_PUBLIC_URL must include a hostname.")
+
+        vuer_kwargs = dict(host='0.0.0.0', port=public_port, domain=f"{public_scheme}://{public_host}:{public_port}",
+                           cert=cert_file, key=key_file,
                            queries=dict(grid=False, initCamPos="0,1.5,2.4", initCamRot="-12,0,0"), queue_len=3)
         if self.static_root is not None:
             vuer_kwargs["static_root"] = str(self.static_root)
@@ -218,6 +512,27 @@ class TeleVuer:
         self._teleop_ua = ""
         self._teleop_at = 0.0
         self.vuer.add_route("/connection", self._connection_info_json, content_type="application/json")
+        # ------------------------------------------------------------------
+        # autobot-guide-service-front 用的辅助通道:
+        #   /host-info — 当前主机的 WAN/eth0 IP + 对外端口(供前端拼 iframe 地址)
+        #   /battery   — PICO 头显电量(由浏览器内的 PICO Web SDK 主动上报,服务侧缓存)
+        #   /ws/aux    — 与 iframe 平行的独立 WebSocket,前端业务代码直连,
+        #                用于接收 PICO 电量等高频遥测推送
+        # ------------------------------------------------------------------
+        self._host_info_cache = host_info.detect_ips()
+        self._battery_state: dict = {
+            "level": None,
+            "charging": None,
+            "deviceName": None,
+            "updatedAt": 0,
+            "source": "none",  # none | browser | fallback
+        }
+        self._aux_ws_clients: set = set()
+        self._aux_lock = threading.Lock()
+        self.vuer.add_route("/host-info", self._host_info_json, content_type="application/json")
+        self.vuer.add_route("/battery", self._battery_json, content_type="application/json")
+        # 注册独立 WebSocket 路由:不走 Vuer 的下行 / 上行协议。
+        self._register_aux_websocket()
         self._wrap_downlink()
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
@@ -233,7 +548,12 @@ class TeleVuer:
                     raise ValueError("[TeleVuer] static dashboard currently supports only monocular cameras.")
                 fn = self.main_static_dashboard_monocular_webrtc
             elif self.webrtc:
-                fn = self.main_image_binocular_webrtc if self.binocular else self.main_image_monocular_webrtc
+                if self.binocular and self.stereo_split_webrtc:
+                    fn = self.main_image_binocular_webrtc_split
+                elif self.binocular:
+                    fn = self.main_image_binocular_webrtc
+                else:
+                    fn = self.main_image_monocular_webrtc
             elif self.zmq:
                 self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
                 self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
@@ -247,7 +567,12 @@ class TeleVuer:
                 raise ValueError("[TeleVuer] immersive mode requires zmq=True or webrtc=True.")
         elif self.display_mode == "ego":
             if self.webrtc:
-                fn = self.main_image_binocular_webrtc_ego if self.binocular else self.main_image_monocular_webrtc_ego
+                if self.binocular and self.stereo_split_webrtc:
+                    fn = self.main_image_binocular_webrtc_ego_split
+                elif self.binocular:
+                    fn = self.main_image_binocular_webrtc_ego
+                else:
+                    fn = self.main_image_monocular_webrtc_ego
             elif self.zmq:
                 self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
                 self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
@@ -894,15 +1219,79 @@ class TeleVuer:
         try:
             session.upsert(
                 [
-                    WebRTCStereoVideoPlane(
-                        src=self.webrtc_url,
+                     WebRTCStereoVideoPlane(
+                         src=self.webrtc_url,
+                         iceServer=None,
+                         iceServers=[],
+                         key="video-quad",
+                          # The stream is side-by-side: self.aspect_ratio is
+                          # already calculated from one eye's width. Applying
+                          # the old 1.3 multiplier stretched the XR view.
+                          aspect=self.aspect_ratio,
+                          height=self.webrtc_immersive_height,
+                          distanceToCamera=self.webrtc_immersive_distance,
+                          layout="stereo-left-right",
+                          # The PICO WebXR eye order is reversed relative to
+                          # the SBS stream produced by the camera.
+                          invertStereo=False,
+                     ),
+                 ],
+                 to="bgChildren",
+             )
+        except AssertionError:
+            return
+        await self._keep_session_alive(session)
+
+    async def main_image_binocular_webrtc_ego_split(self, session):
+        if self.use_hand_tracking:
+            session.upsert(
+                [
+                    Hands(
+                        stream=True,
+                        key="hands",
+                        hideLeft=True,
+                        hideRight=True
+                    ),
+                ],
+                to="bgChildren",
+            )
+        else:
+            session.upsert(
+                [
+                    MotionControllers(
+                        stream=True,
+                        key="motionControllers",
+                        left=True,
+                        right=True,
+                    ),
+                ],
+                to="bgChildren",
+            )
+
+        if not self._session_is_active(session):
+            return
+        try:
+            session.upsert(
+                [
+                    WebRTCVideoPlane(
+                        src=self.webrtc_url_left,
                         iceServer=None,
                         iceServers=[],
-                        key="video-quad",
-                        aspect=self.aspect_ratio * 1.3,
-                        height=self.webrtc_immersive_height,
-                        distanceToCamera=self.webrtc_immersive_distance,
-                        layout="stereo-left-right"
+                        key="video-quad-left",
+                        aspect=self.aspect_ratio,
+                        height=self.webrtc_ego_height,
+                        distanceToCamera=self.webrtc_ego_distance,
+                        layers=1,
+                    ),
+                    WebRTCVideoPlane(
+                        src=self.webrtc_url_right,
+                        iceServer=None,
+                        iceServers=[],
+                        key="video-quad-right",
+                        aspect=self.aspect_ratio,
+                        height=self.webrtc_ego_height,
+                        distanceToCamera=self.webrtc_ego_distance,
+                        layers=2,
                     ),
                 ],
                 to="bgChildren",
@@ -910,6 +1299,66 @@ class TeleVuer:
         except AssertionError:
             return
         await self._keep_session_alive(session)
+
+    async def main_image_binocular_webrtc_split(self, session):
+        if self.use_hand_tracking:
+            session.upsert(
+                [
+                    Hands(
+                        stream=True,
+                        key="hands",
+                        hideLeft=True,
+                        hideRight=True
+                    ),
+                ],
+                to="bgChildren",
+            )
+        else:
+            session.upsert(
+                [
+                    MotionControllers(
+                        stream=True,
+                        key="motionControllers",
+                        left=True,
+                        right=True,
+                    ),
+                ],
+                to="bgChildren",
+            )
+
+        if not self._session_is_active(session):
+            return
+        try:
+            session.upsert(
+                [
+                    WebRTCVideoPlane(
+                        src=self.webrtc_url_left,
+                        iceServer=None,
+                        iceServers=[],
+                        key="video-quad-left",
+                        aspect=self.aspect_ratio,
+                        height=self.webrtc_immersive_height,
+                        distanceToCamera=self.webrtc_immersive_distance,
+                        layers=1,
+                    ),
+                    WebRTCVideoPlane(
+                        src=self.webrtc_url_right,
+                        iceServer=None,
+                        iceServers=[],
+                        key="video-quad-right",
+                        aspect=self.aspect_ratio,
+                        height=self.webrtc_immersive_height,
+                        distanceToCamera=self.webrtc_immersive_distance,
+                        layers=2,
+                    ),
+                ],
+                to="bgChildren",
+            )
+        except AssertionError:
+            return
+        await self._keep_session_alive(session)
+
+
 
     async def main_image_monocular_webrtc(self, session):
         if self.use_hand_tracking:
@@ -943,7 +1392,9 @@ class TeleVuer:
                         iceServer=None,
                         iceServers=[],
                         key="video-quad",
-                        aspect=self.aspect_ratio * 1.3,
+                         # Keep the XR plane at one-eye aspect ratio; the
+                         # stereo layout handles the side-by-side stream.
+                         aspect=self.aspect_ratio,
                         height=self.webrtc_immersive_height,
                         distanceToCamera=self.webrtc_immersive_distance,
                     ),
@@ -952,7 +1403,55 @@ class TeleVuer:
             )
         except AssertionError:
             return
+        # 桌面浏览器里没有连续位姿输入时,画面保持静止。为了不拖拽也能让画面"活",
+        # 给视频平面加一个缓慢的呼吸摆动(auto sway):仅在非 PICO(无真实遥操设备)
+        # 时生效,幅度可经 XR_TELEOP_AUTO_SWAY 环境变量关闭(默认开启)。
+        if self._auto_sway_enabled():
+            self._add_auto_sway_task(session)
         await self._keep_session_alive(session)
+
+    # ------------------------------------------------------------------
+    # 桌面浏览器自动摆动(auto sway):让视频平面缓慢旋转,产生"画面在动"效果。
+    # 只在没有 PICO 设备持续发位姿(未处于遥操中)时运行,避免干扰真实遥操。
+    # ------------------------------------------------------------------
+    def _auto_sway_enabled(self) -> bool:
+        return os.getenv("XR_TELEOP_AUTO_SWAY", "1").strip() in ("1", "true", "yes", "on")
+
+    def _add_auto_sway_task(self, session) -> None:
+        """为当前会话启动自动摇摆协程(同一 session 只启一个)。"""
+        _key = (id(session), getattr(session, "CURRENT_WS_ID", 0))
+        if getattr(self, "_auto_sway_tasks", None) is None:
+            self._auto_sway_tasks = set()
+        if _key in self._auto_sway_tasks:
+            return
+        self._auto_sway_tasks.add(_key)
+
+        async def sway_loop():
+            try:
+                t0 = time.time()
+                period = float(os.getenv("XR_TELEOP_AUTO_SWAY_PERIOD", "9.0"))
+                amp = float(os.getenv("XR_TELEOP_AUTO_SWAY_AMPLITUDE", "0.06"))
+                while self._session_is_active(session):
+                    # 用户开始遥操(有数据进来)时自动停止摆动,避免干扰。
+                    if bool(self.motion_data_ready):
+                        await asyncio.sleep(0.5)
+                        continue
+                    phase = (time.time() - t0) * (2 * math.pi / period)
+                    # 小幅往复摆动:绕 Y(水平扫视)和 X(轻微俯仰)。
+                    sway_y = amp * math.sin(phase)
+                    sway_x = amp * 0.35 * math.sin(phase * 1.7)
+                    try:
+                        session.update @ WebRTCVideoPlane(
+                            key="video-quad",
+                            rotation=[sway_x, sway_y, 0.0],
+                        )
+                    except AssertionError:
+                        break
+                    await asyncio.sleep(0.15)
+            finally:
+                self._auto_sway_tasks.discard(_key)
+
+        asyncio.ensure_future(sway_loop())
 
     async def main_static_dashboard_monocular_webrtc(self, session):
         if self.use_hand_tracking:
@@ -1003,7 +1502,7 @@ class TeleVuer:
                 iceServer=None,
                 iceServers=[],
                 key="head-camera-screen",
-                aspect=self.aspect_ratio * 1.3,
+                         aspect=self.aspect_ratio,
                 height=camera["height"],
                 distanceToCamera=camera["distance"],
                 position=camera["position"],
@@ -1165,10 +1664,11 @@ class TeleVuer:
                         iceServer=None,
                         iceServers=[],
                         key="video-quad",
-                        aspect=self.aspect_ratio * 1.3,
-                        height=self.webrtc_ego_height,
-                        distanceToCamera=self.webrtc_ego_distance,
-                        layout="stereo-left-right"
+                         aspect=self.aspect_ratio,
+                         height=self.webrtc_ego_height,
+                         distanceToCamera=self.webrtc_ego_distance,
+                         layout="stereo-left-right",
+                         invertStereo=True,
                     ),
                 ],
                 to="bgChildren",
@@ -1440,3 +1940,137 @@ class TeleVuer:
         """bool, whether at least one hand or controller motion data event has been received."""
         with self.motion_data_ready_shared.get_lock():
             return self.motion_data_ready_shared.value
+
+    # ======================================================================
+    # autobot-guide-service 集成:动态 host-info / 电池 / 独立辅助 WS
+    # ======================================================================
+    def _register_aux_websocket(self) -> None:
+        """注册 /ws/aux 独立 WebSocket,走浏览器原生 ws,不与 Vuer 协议耦合。
+
+        用途:
+          * PICO 头显的浏览器内 JS 通过此通道上报电量(避免 iframe 内 JS 桥接);
+          * 服务端把最新电池状态广播给所有订阅者。
+
+        实现细节:
+          vuer 内部用 aiohttp.web.Application,直接挂接到 ``self.vuer.app.router``。
+        """
+        try:
+            from aiohttp import web  # noqa: WPS433 (local import: aiohttp 是可选依赖)
+        except ImportError:
+            logging.warning(
+                "[TeleVuer] aiohttp not available; /ws/aux disabled. "
+                "Install with `pip install vuer[all]` to enable."
+            )
+            return
+
+        try:
+            self.vuer.app.router.add_get("/ws/aux", self._handle_aux_ws)
+            self.vuer.app.router.add_get("/_aux_info", self._aux_info_probe)
+            logging.info("[TeleVuer] /ws/aux registered on aiohttp router")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("[TeleVuer] /ws/aux registration failed: %s", exc)
+
+    async def _aux_info_probe(self, request):
+        """供前端探测辅助 WS 端点是否存在。"""
+        from aiohttp import web
+
+        return web.json_response(
+            {
+                "wsPath": "/ws/aux",
+                "hostInfoPath": "/host-info",
+                "batteryPath": "/battery",
+                "protocols": ["battery-update"],
+            }
+        )
+
+    def _host_info_json(self) -> str:
+        """返回当前主机的对外地址,供 autobot 前端动态拼 iframe URL。"""
+        # 每次请求都重新检测一次,适应 IP 变化(如 wlan0 DHCP 重连)。
+        info = host_info.detect_ips()
+        self._host_info_cache = info
+        public_port = host_info.public_port()
+        return json.dumps(
+            {
+                "robotId": host_info.robot_id() or None,
+                "wanIface": info.get("wan_iface"),
+                "wanIp": info.get("wan_ip"),
+                "eth0Ip": info.get("eth0_ip"),
+                "port": public_port,
+                "viewerUrl": f"https://{info.get('wan_ip')}:{public_port}",
+                "wsUrl": f"wss://{info.get('wan_ip')}:{public_port}",
+                "detectedAt": int(time.time() * 1000),
+            }
+        )
+
+    def _battery_json(self) -> str:
+        """返回最近一次浏览器上报的 PICO 头显电量。
+
+        字段:
+          level       int|None  0-100
+          charging    bool|None
+          deviceName  str|None 头显型号 / 序列号
+          updatedAt   int       上次更新时间(epoch ms),0 表示从未上报
+          source      str       none/browser/fallback
+          connected   bool      是否有活跃 ws 客户端
+        """
+        connected = bool(self._aux_ws_clients)
+        payload = dict(self._battery_state)
+        payload["connected"] = connected
+        payload["stale"] = payload["updatedAt"] > 0 and (time.time() * 1000 - payload["updatedAt"]) > 30_000
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def _handle_aux_ws(self, request):
+        """处理 /ws/aux 升级请求;内部协议是 JSON 文本消息。"""
+        from aiohttp import web
+
+        ws = web.WebSocketResponse(heartbeat=20)
+        await ws.prepare(request)
+        self._aux_ws_clients.add(ws)
+        try:
+            # 上线时立即推送当前电量快照
+            snapshot = dict(self._battery_state)
+            snapshot["connected"] = True
+            await ws.send_str(json.dumps({"type": "battery-snapshot", "data": snapshot}))
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        payload = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        continue
+                    self._handle_aux_message(payload)
+                elif msg.type == web.WSMsgType.ERROR:
+                    break
+        finally:
+            self._aux_ws_clients.discard(ws)
+            await ws.close()
+
+    def _handle_aux_message(self, payload: dict) -> None:
+        """处理来自浏览器侧的辅助消息(目前只关心电量)。"""
+        mtype = payload.get("type")
+        if mtype == "battery-update":
+            data = payload.get("data") or {}
+            self._update_battery_state({**data, "source": "browser"})
+
+    def _update_battery_state(self, new_state: dict) -> None:
+        with self._aux_lock:
+            self._battery_state.update(
+                {
+                    k: new_state.get(k, self._battery_state.get(k))
+                    for k in ("level", "charging", "deviceName")
+                }
+            )
+            self._battery_state["updatedAt"] = int(time.time() * 1000)
+            self._battery_state["source"] = new_state.get("source", self._battery_state.get("source", "browser"))
+        # 异步广播给其它订阅者
+        snapshot = dict(self._battery_state)
+        snapshot["connected"] = True
+        msg = json.dumps({"type": "battery-snapshot", "data": snapshot})
+        dead: list = []
+        for ws in list(self._aux_ws_clients):
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(ws.send_str(msg))
+            except Exception:  # noqa: BLE001
+                dead.append(ws)
+        for ws in dead:
+            self._aux_ws_clients.discard(ws)

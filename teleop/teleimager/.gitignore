@@ -1,11 +1,6 @@
-.vscode/
-build/
-*pycache*
+# teleimager runtime artifacts
+teleimager_auto.log
+.teleimager.pid
+__pycache__/
 *.pyc
-*.egg-info
-*.pem
-*.srl
-*.csr
-*.key
-*.cnf
-*_client.yaml
+*.pyo

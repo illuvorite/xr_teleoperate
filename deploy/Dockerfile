@@ -95,6 +95,9 @@ COPY scripts/ ./scripts/
 COPY *.pkl ./
 COPY *.md ./
 
+# ---- Copy Vendor Binaries ----
+COPY teleop/teleimager/vendor/ /workspace/teleop/teleimager/vendor/
+
 # ---- Use project-builtin certificates ----
 RUN mkdir -p /workspace/certs /root/.config/xr_teleoperate \
     && cp teleop/televuer/cert.pem /workspace/certs/cert.pem \
@@ -114,10 +117,13 @@ ENV PYTHONUNBUFFERED=1 \
     XR_TELEOP_INPUT_MODE=controller \
     XR_TELEOP_DISPLAY_MODE=immersive \
     IMG_SERVER_IP=192.168.2.203 \
-    DDS_INTERFACE=eth0
+    DDS_INTERFACE=eth0 \
+    VENDOR_DIR=/workspace/teleop/teleimager/vendor \
+    CAMERA_SDK_DIR=/workspace/teleop/teleimager/vendor/camera_sdk_test \
+    GLIBC235_DIR=/workspace/teleop/teleimager/vendor/glibc235/lib/aarch64-linux-gnu
 
 # ---- Install entrypoint script ----
-COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY deploy/scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # ---- Create directories ----

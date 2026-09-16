@@ -1,0 +1,86 @@
+head_camera:
+  enable_zmq: false
+  zmq_port: 55555
+  enable_webrtc: true
+  webrtc_port: 60001
+  webrtc_codec: h264
+  bitrate: 12000000
+  type: scam
+  sdk_library_path: /home/unitree/camera_sdk_test/build/libscam.so
+  device_index: 0
+  output_format: nv12
+  eye_width: 1920
+  eye_height: 1200
+  capture_image_shape:
+  - 1200
+  - 3840
+  image_shape:
+  - 720
+  - 2560
+  binocular: true
+  stereo_sbs: true
+  stereo_fusion: false
+  stereo_crop_left: 0
+  stereo_crop_right: 0
+  stereo_blend_alpha: 0.5
+  stereo_right_shift_x: -5
+  stereo_shift_x: 0
+  stereo_split_webrtc: false
+  webrtc_port_left: 60001
+  webrtc_port_right: 60002
+  fps: 30
+  video_id: 6
+  serial_number: null
+  physical_path: /sys/devices/platform/3610000.xhci/usb2/2-2/2-2.3/2-2.3:1.0
+  stabilization:
+    enabled: true
+    mode: gyro
+    acc_divisor_to_g: 1000
+    axis_map:
+    - 0
+    - 1
+    - 2
+    axis_sign:
+    - -1.0
+    - -1.0
+    - 1.0
+    exposure_ref: midpoint
+    static_calibration_s: 2.0
+    static_gyro_dps: 1.5
+    smoothing_alpha: 0.35
+    motion_boost: true
+    max_correction_deg: 8.0
+    crop_ratio: 0.06
+    border_mode: replicate
+    imu_gap_reset_ms: 50
+    imu_timeout_bypass_ms: 200
+left_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55556
+  enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+  type: opencv
+  image_shape:
+  - 480
+  - 640
+  binocular: false
+  fps: 30
+  video_id: 999
+  serial_number: null
+  physical_path: null
+right_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55557
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+  type: opencv
+  image_shape:
+  - 480
+  - 640
+  binocular: false
+  fps: 30
+  video_id: 999
+  serial_number: null
+  physical_path: null

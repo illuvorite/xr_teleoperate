@@ -360,11 +360,82 @@ docker compose down -v
 3. **网络模式**：使用 `host` 网络模式，确保防火墙规则正确配置
 4. **机器人安全**：遥操作前确保机器人处于安全状态，周围无人
 
+
+## 离线部署
+
+如果目标机器无法访问 Docker Hub 或 GitHub，可以使用离线部署方案。
+
+### 方案 A：Docker 镜像 tar 包（推荐）
+
+在能访问 Docker Hub 的机器上打包镜像，复制到目标机器后直接加载。
+
+`ash
+# 1. 打包镜像
+cd deploy/scripts
+bash package_docker.sh ../dist
+
+# 2. 复制到目标机器
+scp ../dist/xr_teleoperate-offline-*.tar.gz user@target:/tmp/
+
+# 3. 在目标机器上解压并加载
+cd /tmp
+tar -xzf xr_teleoperate-offline-*.tar.gz
+docker load < xr-teleoperate-latest.tar.gz
+docker load < teleimager-latest.tar.gz
+
+# 4. 部署
+mkdir -p xr_teleoperate/deploy
+cd xr_teleoperate/deploy
+tar -xzf deploy-config-latest.tar.gz
+cp .env.example .env
+# 编辑 .env 设置 IMG_SERVER_IP
+docker compose -f docker-compose.remote.yml up -d
+`
+
+### 方案 B：源码压缩包
+
+如果目标机器无法访问 Docker Hub，但能访问 PyPI/apt，可以使用源码包。
+
+`ash
+# 1. 打包源码（在开发机上执行）
+cd deploy/scripts
+bash package_source.sh ../dist
+
+# 2. 复制到目标机器
+scp -r ../dist user@target:/tmp/
+
+# 3. 在目标机器上解压并安装
+cd /tmp/dist
+bash install.sh
+
+# 4. 配置并启动
+cd xr_teleoperate
+cp .env.example .env
+# 编辑 .env
+source venv/bin/activate
+python teleop/teleop_hand_and_arm.py \
+    --arm G1_29 \
+    --input-mode controller \
+    --display-mode immersive \
+    --network-interface eth0 \
+    --motion \
+    --static-dashboard
+`
+
+### 方案对比
+
+| 方案 | 文件大小 | 部署时间 | 依赖要求 |
+|------|---------|---------|---------|
+| Docker 镜像 tar | ~10 GB | 5 分钟 | 仅需 Docker |
+| 源码压缩包 | ~500 MB | 30-60 分钟 | 需 Python 3.8 + 系统依赖 |
+| 远程拉取镜像 | ~0 MB | 2 分钟 | 需 Docker + 网络 |
+
 ## 相关链接
 
 - [xr_teleoperate GitHub](https://github.com/unitreerobotics/xr_teleoperate)
 - [Unitree SDK2 Python](https://github.com/unitreerobotics/unitree_sdk2_python)
 - [TeleVuer](https://github.com/silencht/televuer)
 - [TeleImager](https://github.com/silencht/teleimager)
+
 
 
