@@ -25,6 +25,12 @@ episode_0*
 *.pkl
 # 前端构建产物(由 scripts 生成,不入库)
 dist/
+# AI 编码插件(Kilo Code)的隔离工作区副本,只应在本地存在
+.kilo/
+# teleimager 运行期产物:日志 / 相机后端状态标记 / pid 文件(都不应入库)
+teleop/teleimager/teleimager_auto.log
+teleop/teleimager/.teleimager_last_type
+teleop/teleimager/teleimager_auto_switcher.pid
 # 保留 vendor 目录结构（相机 SDK + 运行时库）
 !teleop/teleimager/vendor/
 !teleop/teleimager/vendor/camera_sdk_test/build/*.so
