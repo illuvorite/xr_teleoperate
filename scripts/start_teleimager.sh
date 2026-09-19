@@ -46,80 +46,62 @@ if [[ "$CAM_BACKEND" == "auto" ]]; then
 fi
 
 # ---- 相机可用性检测：SCAM 立体相机不可用时自动回退到 RealSense 深度相机 ----
+#
+# ⚠ 必须在当前 shell 直接调用，不要写成 ACTIVE_CONFIG=$(detect_camera_fallback ...)：
+#   命令替换会让整个函数跑在子 shell 里，函数内对 CAM_BACKEND / EXTRA_ARGS / ACTIVE_CONFIG
+#   的赋值不会传回父 shell —— 表现是：日志已经打了"自动回退到 RealSense 配置"，但父 shell
+#   里 backend 仍是 scam、配置路径仍是空的，teleimager 最终按内置默认的 SCAM 配置启动而反复崩溃。
+#   结果通过 ACTIVE_CONFIG / CAM_BACKEND / EXTRA_ARGS 三个全局变量返回。
+#
+# 另外这里刻意不用 python3+pyyaml 解析：conda 环境在本步之后才激活，系统 python3 不一定装了
+# yaml，解析失败会静默跳过检测（cam_type 取到空串即当成"非 scam"直接返回），改用 sed 读取。
 detect_camera_fallback() {
   local config_file="$1"
+  ACTIVE_CONFIG="$config_file"
+
   local cam_type
-  cam_type=$(python3 -c "
-import yaml, sys
-with open('$config_file') as f:
-    cfg = yaml.safe_load(f)
-print(cfg.get('head_camera', {}).get('type', '').lower())
-" 2>/dev/null || echo "")
+  cam_type=$(sed -n 's/^[[:space:]]*type:[[:space:]]*\([A-Za-z0-9_]*\).*/\1/p' "$config_file" | head -n1 | tr '[:upper:]' '[:lower:]')
 
   if [[ "$cam_type" != "scam" ]]; then
-    echo "$config_file"
-    return
+    return 0
   fi
 
   local video_id physical_path
-  video_id=$(python3 -c "
-import yaml, sys
-with open('$config_file') as f:
-    cfg = yaml.safe_load(f)
-vid = cfg.get('head_camera', {}).get('video_id', None)
-print(vid if vid is not None else '')
-" 2>/dev/null || echo "")
-  physical_path=$(python3 -c "
-import yaml, sys
-with open('$config_file') as f:
-    cfg = yaml.safe_load(f)
-pp = cfg.get('head_camera', {}).get('physical_path', None)
-print(pp if pp else '')
-" 2>/dev/null || echo "")
+  video_id=$(sed -n 's/^[[:space:]]*video_id:[[:space:]]*\([0-9]\+\).*/\1/p' "$config_file" | head -n1)
+  physical_path=$(sed -n 's/^[[:space:]]*physical_path:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$config_file" | head -n1 | tr -d "'\"")
 
   local stereo_available=0
-
-  if [[ -n "$video_id" ]]; then
-    local video_path="/dev/video${video_id}"
-    if [[ -e "$video_path" ]]; then
-      stereo_available=1
-    fi
+  if [[ -n "$video_id" && -e "/dev/video${video_id}" ]]; then
+    stereo_available=1
+  fi
+  if [[ "$stereo_available" -eq 0 && -n "$physical_path" && -e "$physical_path" ]]; then
+    stereo_available=1
   fi
 
-  if [[ -z "$physical_path" ]]; then
-    physical_path=$(python3 -c "
-import yaml, sys
-with open('$config_file') as f:
-    cfg = yaml.safe_load(f)
-# fallback: read from cam_config_server.yaml directly
-" 2>/dev/null || echo "")
+  if [[ "$stereo_available" -eq 1 ]]; then
+    return 0
   fi
 
-  if [[ "$stereo_available" -eq 0 && -n "$physical_path" ]]; then
-    if [[ -e "$physical_path" ]]; then
-      stereo_available=1
-    fi
+  echo "[teleimager] 警告：SCAM 立体相机未检测到 (video_id=${video_id:-null}, physical_path=${physical_path:-null})" >&2
+  local rs_config="$TEL_DIR/cam_config_server_realsense.yaml"
+  if [[ ! -f "$rs_config" ]]; then
+    echo "[teleimager] 错误：未找到回退配置 $rs_config" >&2
+    return 1
   fi
 
-  if [[ "$stereo_available" -eq 0 ]]; then
-    echo "[teleimager] 警告：SCAM 立体相机未检测到 (video_id=${video_id:-null}, physical_path=${physical_path:-null})" >&2
-    local rs_config="$TEL_DIR/cam_config_server_realsense.yaml"
-    if [[ -f "$rs_config" ]]; then
-      echo "[teleimager] 自动回退到 RealSense 深度相机配置: $rs_config" >&2
-      CAM_BACKEND=opencv
-      CONFIG_FILE="$rs_config"
-      EXTRA_ARGS="--rs"
-    else
-      echo "[teleimager] 错误：未找到回退配置 $rs_config" >&2
-      exit 1
-    fi
-  else
-    echo "$config_file"
-  fi
+  echo "[teleimager] 自动回退到 RealSense 深度相机配置: $rs_config" >&2
+  ACTIVE_CONFIG="$rs_config"
+  CAM_BACKEND=opencv
+  EXTRA_ARGS="--rs"
+  return 0
 }
 
-ACTIVE_CONFIG=$(detect_camera_fallback "$TEL_DIR/cam_config_server.yaml")
-EXTRA_ARGS="${EXTRA_ARGS:-}"
+EXTRA_ARGS=""
+ACTIVE_CONFIG="$TEL_DIR/cam_config_server.yaml"
+if ! detect_camera_fallback "$ACTIVE_CONFIG"; then
+  exit 1
+fi
+echo "[teleimager] 使用配置: $ACTIVE_CONFIG  backend=$CAM_BACKEND ${EXTRA_ARGS}" >&2
 
 if [[ "$CAM_BACKEND" != "opencv" && "$CAM_BACKEND" != "scam" ]]; then
   echo "[teleimager] 错误：CAM_BACKEND 仅支持 auto|opencv|scam（当前 $CAM_BACKEND）" >&2
@@ -150,9 +132,15 @@ if [[ ! -d "$CAMERA_SDK_DIR/build" ]]; then
   echo "[teleimager] 警告：项目内 vendor/camera_sdk_test 不存在，回退到 /home/unitree/camera_sdk_test" >&2
   CAMERA_SDK_DIR="/home/unitree/camera_sdk_test"
 fi
-if [[ ! -x "$GLIBC235_DIR/ld-linux-aarch64.so.1" ]]; then
+# 判定"包内是否带了 glibc235"必须用 -f，不能用 -x：
+# 部署包在 Windows 上打包，NTFS 没有 unix 权限位，包内文件一律是 666（目录 777），
+# 解压后 ld-linux 没有执行位 —— 用 -x 判断会把"包内明明有"误判成"不存在"而回退。
+# 位不对时自己补上（文件属主是部署用户，chmod 不需要 root）。
+if [[ ! -f "$GLIBC235_DIR/ld-linux-aarch64.so.1" ]]; then
   echo "[teleimager] 警告：项目内 vendor/glibc235 不存在，回退到 /home/unitree/glibc235" >&2
   GLIBC235_DIR="/home/unitree/glibc235/lib/aarch64-linux-gnu"
+elif [[ ! -x "$GLIBC235_DIR/ld-linux-aarch64.so.1" ]]; then
+  chmod +x "$GLIBC235_DIR/ld-linux-aarch64.so.1" 2>/dev/null || true
 fi
 
 # ---- conda 环境（多候选路径发现，不依赖交互 shell 的 PATH）----
@@ -209,11 +197,13 @@ if [[ "$CAM_BACKEND" == "scam" ]]; then
   # SCAM SDK 需要 glibc-2.35 包装（方案文档 §1.4B）：仅对捕获进程注入，勿 export 到整个脚本。
   # teleimager-server 是 Python 脚本（非 ELF），必须由加载器先启动 python3.10、脚本作参数。
   GLIBC_235="${GLIBC_235:-$GLIBC235_DIR}"
-  if [[ ! -x "$GLIBC_235/ld-linux-aarch64.so.1" ]]; then
+  # 同前：包内文件没有执行位，判定用 -f，然后自己补 +x。
+  if [[ ! -f "$GLIBC_235/ld-linux-aarch64.so.1" ]]; then
     echo "[teleimager] 错误：未找到 glibc-2.35 包装 $GLIBC_235/ld-linux-aarch64.so.1" >&2
     echo "[teleimager] 请先按方案文档 §1.4B 解压 Ubuntu 22.04 libc6 到项目 vendor 目录或 ~/glibc235" >&2
     exit 1
   fi
+  [[ -x "$GLIBC_235/ld-linux-aarch64.so.1" ]] || chmod +x "$GLIBC_235/ld-linux-aarch64.so.1" 2>/dev/null || true
   launch env \
     LD_LIBRARY_PATH="$GLIBC_235:$CONDA_PREFIX/lib" \
     LD_PRELOAD="$CONDA_PREFIX/lib/libgomp.so.1" \

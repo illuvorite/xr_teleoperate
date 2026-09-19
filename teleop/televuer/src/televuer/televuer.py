@@ -68,6 +68,12 @@ _ORBIT_AUTOROTATE_REPL = 'Nn(this,"autoRotate",!0),Nn(this,"autoRotateSpeed",1.6
 #   那种情况下页面跑在运营人员的电脑浏览器里,若照常上报,控制台会把运营电脑的
 #   电量当成头显电量。因此只在"顶层窗口 + 非 /proxy/vr/ 路径"时才上报。
 #
+# 为什么还要做"仅头显"判断(2026-09-19 修):
+#   即使排除了 iframe 与代理页面,"运营电脑直接在标签页打开 https://{wanIp}:8012/"
+#   仍会上报 —— 那台电脑通常插着电源(Battery API 报 100%),于是与头显的真实电量
+#   (如 24%)交替覆盖同一份服务端缓存,控制台就会看到"电量在 24% 与 100% 之间跳变"。
+#   与 televuer 侧 `_is_headset_ua()` 同口径:只允许 XR/头显类客户端上报。
+#
 # 取电优先级:
 #   1. window.__XR_TELEOP_BATTERY__ —— 可选的外部注入(PICO Web SDK 等),便于
 #      后续在不动本文件的前提下换成厂商接口;
@@ -82,6 +88,13 @@ _BATTERY_REPORT_JS = r"""
     if (window.top !== window.self) return;
     if (location.pathname.indexOf('/proxy/vr/') === 0) return;
   } catch (e) { return; }
+
+  // 只让"看起来是头显"的客户端上报(桌面浏览器一律不上报,避免污染头显电量)。
+  const HEADSET_UA_RE = /pico|quest|oculus|vision ?pro|hmd|headset|android[^)]*\b(vr|xr)\b/i;
+  if (!HEADSET_UA_RE.test(navigator.userAgent || '')) {
+    console.info('[xr-teleop-battery] 非头显客户端,跳过头显电量上报。');
+    return;
+  }
 
   const WS_PATH = '/ws/aux';
   const KEEPALIVE_MS = 20000;
@@ -178,7 +191,9 @@ _BATTERY_REPORT_JS = r"""
 })();
 """
 
-_PATCHED_CLIENT_MARKER = ".patched-v8"
+# 注意:注入脚本(_BATTERY_REPORT_JS / _AUTO_ORBIT_JS / _VUER_UI_HIDE_CSS)改动后必须
+# 提升该 marker,否则已存在的 client_patch 缓存会被直接复用,新脚本不会生效。
+_PATCHED_CLIENT_MARKER = ".patched-v9"
 
 # 自动视点环绕注入脚本:周期性向 vuer 的 <canvas> 派发微弱 pointer 事件序列,
 # 让原生相机拖拽逻辑以为鼠标在缓慢拖动。用户真实按下时暂停,抬起后恢复。
@@ -294,6 +309,27 @@ def _device_type_from_ua(ua: str) -> str:
     return ua.strip()[:80] or "未知设备"
 
 
+# 与注入脚本 _BATTERY_REPORT_JS 里的 HEADSET_UA_RE 保持同一口径:只有头显类客户端
+# 才允许上报/被接受 PICO 电量。
+#
+# 为什么需要这道门:在"非 iframe + 非 /proxy/vr/ 路径"两个条件下,直接用桌面浏览器
+# 打开 https://{wanIp}:8012/ 仍会上报该电脑自己的电量(通常插电 = 100%),与头显的
+# 真实电量交替覆盖服务端缓存 → 控制台看到 24% ↔ 100% 跳变。
+#
+# 环境变量 XR_TELEOP_BATTERY_ALLOW_ANY_UA=1 可放开该限制(型号识别不准时的应急开关)。
+_HEADSET_UA_RE = re.compile(
+    r"pico|quest|oculus|vision ?pro|hmd|headset|android[^)]*\b(vr|xr)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_headset_ua(ua: str) -> bool:
+    """该 User-Agent 是否来自 XR 头显(决定是否接受其电量上报)。"""
+    if os.getenv("XR_TELEOP_BATTERY_ALLOW_ANY_UA", "0").strip() in ("1", "true", "yes", "on"):
+        return True
+    return bool(ua) and bool(_HEADSET_UA_RE.search(ua))
+
+
 def _patched_client_root() -> Path:
     """Return a patched copy of vuer's client build with client defaults changed.
 
@@ -375,11 +411,16 @@ def _patched_client_root() -> Path:
 
     index.write_text(html, encoding="utf-8")
 
-    marker.write_text("v4", encoding="utf-8")
+    marker.write_text("v9", encoding="utf-8")
     return patched_dir
 
 
 class TeleVuer:
+    # "正在摇操"的时间窗(秒):最近这么长时间内收到过手柄/手势运动数据才算在摇操。
+    # 控制台的"摇操中"徽标与它对齐(过窗后回落为"设备已接入"),避免用锁存值后
+    # 头显断开也一直显示"摇操中"。
+    _TELEOP_ACTIVE_WINDOW_S = float(os.getenv("XR_TELEOP_ACTIVE_WINDOW_S", "6"))
+
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
                         display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None,
                         cert_file: str=None, key_file: str=None, http_mode: bool=False,
@@ -511,7 +552,10 @@ class TeleVuer:
         self._last_ua = ""
         self._teleop_ua = ""
         self._teleop_at = 0.0
-        self.vuer.add_route("/connection", self._connection_info_json, content_type="application/json")
+        # 最近一次收到手柄/手势运动数据的时间(monotonic)。motion_data_ready 是"曾经
+        # 收到过"的锁存值,不适合直接当"正在摇操"用,这里再记一个时间窗。
+        self._motion_at = 0.0
+        self._register_json_route("/connection", self._connection_info_json)
         # ------------------------------------------------------------------
         # autobot-guide-service-front 用的辅助通道:
         #   /host-info — 当前主机的 WAN/eth0 IP + 对外端口(供前端拼 iframe 地址)
@@ -526,14 +570,23 @@ class TeleVuer:
             "deviceName": None,
             "updatedAt": 0,
             "source": "none",  # none | browser | fallback
+            "reportedBy": None,  # 上报方的 User-Agent(诊断用,便于定位"谁在报电量")
         }
         self._aux_ws_clients: set = set()
         self._aux_lock = threading.Lock()
-        self.vuer.add_route("/host-info", self._host_info_json, content_type="application/json")
-        self.vuer.add_route("/battery", self._battery_json, content_type="application/json")
+        # id(ws) -> {"ua": str, "headset": bool, "device": str}:区分上报方身份,
+        # 只接受头显类客户端的电量上报(详见 _is_headset_ua)。
+        self._aux_ws_meta: dict = {}
+        self._battery_rejected_ua: set = set()
+        self._register_json_route("/host-info", self._host_info_json)
+        self._register_json_route("/battery", self._battery_json)
         # 注册独立 WebSocket 路由:不走 Vuer 的下行 / 上行协议。
         self._register_aux_websocket()
         self._wrap_downlink()
+        # 启动后自检自定义路由是否真的可达:路由被 vuer 自身的 catch-all / 静态路由
+        # 抢占,或在旧版本上根本没注册成功时,这里会明确打日志(否则现象只是
+        # "控制台电量不出数 / 设备状态显示无设备连接",无法定位)。
+        self._schedule_route_selfcheck(public_scheme, public_port)
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
@@ -993,16 +1046,53 @@ class TeleVuer:
             self._teleop_at = time.time()
 
     def _connection_info_json(self) -> str:
-        """`GET /connection` 返回当前遥操连接与设备信息(供 autobot 摇操页轮询)。"""
-        ua = self._teleop_ua or self._last_ua
-        return json.dumps({
-            "connected": bool(self.vuer.ws),
-            "deviceType": _device_type_from_ua(ua),
-            "userAgent": ua,
-            "teleoperating": bool(self.motion_data_ready),
-            "controllerCaptured": bool(self._teleop_ua),
-            "connectedAt": int(self._teleop_at) if self._teleop_at else None,
-        })
+        """`GET /connection` 返回当前遥操连接与设备信息(供 autobot 摇操页轮询)。
+
+        字段语义(控制台据此显示"摇操中 / 设备已接入 / 仅页面连接 / 无设备连接"):
+
+          connected          该 8012 服务上是否有任何页面(查看者也算)连着 —— 服务级,
+                             **不能**用来判断"有没有头显在摇操";
+          teleoperating      最近 ``_TELEOP_ACTIVE_WINDOW_S`` 秒内还在收手柄/手势运动
+                             数据 = 真的有人在摇操。注意不能用 motion_data_ready
+                             的锁存值,否则断连后永远显示"摇操中";
+          controllerCaptured 本次运行中是否曾收到过运动数据(有设备接入过);
+          deviceType/userAgent 正在摇操(或最后接入)设备的 UA 识别结果;
+          connectedAt        最近一次收到运动数据的 epoch 秒;
+          motionIdleMs       距最近一次运动数据的毫秒数(前端可直接用,避免时钟相减);
+          auxConnected       电量辅助通道是否有订阅者。
+
+        该接口被控制台每 5s 轮询一次,任何异常都会让控制台退化成"无设备连接",
+        因此这里整体兜底:即使内部状态读取失败也要返回合法 JSON。
+        """
+        try:
+            ua = self._teleop_ua or self._last_ua
+            motion_idle_ms = (
+                int((time.monotonic() - self._motion_at) * 1000) if self._motion_at else None
+            )
+            teleoperating = bool(motion_idle_ms is not None and motion_idle_ms <= self._TELEOP_ACTIVE_WINDOW_S * 1000)
+            return json.dumps({
+                "connected": bool(self.vuer.ws),
+                "deviceType": _device_type_from_ua(ua),
+                "userAgent": ua,
+                "teleoperating": teleoperating,
+                "controllerCaptured": bool(self._teleop_ua),
+                "connectedAt": int(self._teleop_at) if self._teleop_at else None,
+                "motionIdleMs": motion_idle_ms,
+                "auxConnected": bool(self._aux_ws_clients),
+            })
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("[TeleVuer] /connection 组装失败,返回降级结果: %s", exc)
+            return json.dumps({
+                "connected": False,
+                "deviceType": "未知设备",
+                "userAgent": "",
+                "teleoperating": False,
+                "controllerCaptured": False,
+                "connectedAt": None,
+                "motionIdleMs": None,
+                "auxConnected": False,
+                "error": "connection_state_unavailable",
+            })
 
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
@@ -1042,6 +1132,8 @@ class TeleVuer:
             extract_controllers(right_controller, "right")
             with self.motion_data_ready_shared.get_lock():
                 self.motion_data_ready_shared.value = True
+            # 时间窗:供 /connection 判断"当前是否真的在摇操"(锁存值会一直为真)。
+            self._motion_at = time.monotonic()
             self._record_teleop_device(session)
         except:
             pass
@@ -1091,6 +1183,8 @@ class TeleVuer:
             extract_hands(right_hand, "right")
             with self.motion_data_ready_shared.get_lock():
                 self.motion_data_ready_shared.value = True
+            # 时间窗:供 /connection 判断"当前是否真的在摇操"(锁存值会一直为真)。
+            self._motion_at = time.monotonic()
             self._record_teleop_device(session)
 
         except:
@@ -1944,6 +2038,90 @@ class TeleVuer:
     # ======================================================================
     # autobot-guide-service 集成:动态 host-info / 电池 / 独立辅助 WS
     # ======================================================================
+    def _register_json_route(self, path: str, handler) -> bool:
+        """注册一个返回 JSON 的自定义 GET 路由,并回查路由表确认它真的生效。
+
+        为什么不能"调用完 vuer.add_route 就算数":
+          这些路径是给 autobot 控制台用的。一旦没进路由表(被 vuer 自身的静态 /
+          catch-all 路由抢占、旧版本没有该方法、router 已冻结……),外部现象只有
+          "控制台设备状态显示无设备连接 / 电量不出数",从日志完全看不出原因。
+          这里注册完立即回查 aiohttp 路由表,失败打 ERROR,并在启动后做一次 HTTP
+          自检(见 ``_schedule_route_selfcheck``)。
+        """
+        registered = False
+        try:
+            self.vuer.add_route(path, handler, content_type="application/json")
+            registered = True
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(
+                "[TeleVuer] vuer.add_route(%s) 失败(%s),改为直接挂 aiohttp router", path, exc
+            )
+        if not registered:
+            try:
+                self.vuer.app.router.add_get(path, handler)
+                registered = True
+            except Exception as exc:  # noqa: BLE001
+                logging.error(
+                    "[TeleVuer] 自定义路由 %s 注册失败,控制台将取不到该接口: %s", path, exc
+                )
+                return False
+
+        try:
+            paths = {(route.get_info() or {}).get("path") for route in self.vuer.app.router.routes()}
+            if path not in paths:
+                logging.error(
+                    "[TeleVuer] 自定义路由 %s 不在 aiohttp 路由表中(可能被其它路由抢占),"
+                    "控制台会取不到该接口。当前路由: %s",
+                    path, sorted(p for p in paths if p),
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("[TeleVuer] 路由表回查失败(忽略): %s", exc)
+        return True
+
+    def _schedule_route_selfcheck(self, scheme: str, port: int) -> None:
+        """启动后(延迟)用本机 HTTP 请求打一遍自定义接口,把结果写进日志。
+
+        作用:把"路由没生效"和"设备确实没上报"这两种完全不同的故障区分开 ——
+        前者是 404 / 返回 HTML,后者才是业务上没有数据。
+        环境变量:XR_TELEOP_ROUTE_SELFCHECK=0 关闭;XR_TELEOP_ROUTE_SELFCHECK_DELAY 调延迟。
+        """
+        if os.getenv("XR_TELEOP_ROUTE_SELFCHECK", "1").strip() in ("0", "false", "no", "off"):
+            return
+
+        def _probe() -> None:
+            import ssl
+            import urllib.error
+            import urllib.request
+
+            # vuer.run() 在本对象构造完成之后才启动 aiohttp,先等它起来。
+            time.sleep(float(os.getenv("XR_TELEOP_ROUTE_SELFCHECK_DELAY", "10")))
+            ctx = ssl._create_unverified_context() if scheme == "https" else None
+            for path in ("/connection", "/battery", "/_aux_info"):
+                url = f"{scheme}://127.0.0.1:{port}{path}"
+                try:
+                    with urllib.request.urlopen(url, timeout=5, context=ctx) as resp:
+                        body = resp.read(300).decode("utf-8", "replace").replace("\n", " ")
+                        ctype = resp.headers.get("Content-Type", "")
+                        ok = "json" in ctype.lower()
+                        logging.log(
+                            logging.INFO if ok else logging.ERROR,
+                            "[TeleVuer][self-check] GET %s -> %s %s body=%s%s",
+                            path, resp.status, ctype, body,
+                            "" if ok else "  ← 返回不是 JSON:该自定义路由很可能被 vuer 自身路由抢占/未生效",
+                        )
+                except urllib.error.HTTPError as exc:
+                    logging.error(
+                        "[TeleVuer][self-check] GET %s -> HTTP %s,该自定义路由不可用(控制台会取不到)",
+                        path, exc.code,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.info(
+                        "[TeleVuer][self-check] GET %s 探测失败(服务可能尚未就绪): %s", path, exc
+                    )
+
+        threading.Thread(target=_probe, name="televuer-route-selfcheck", daemon=True).start()
+
     def _register_aux_websocket(self) -> None:
         """注册 /ws/aux 独立 WebSocket,走浏览器原生 ws,不与 Vuer 协议耦合。
 
@@ -1953,6 +2131,8 @@ class TeleVuer:
 
         实现细节:
           vuer 内部用 aiohttp.web.Application,直接挂接到 ``self.vuer.app.router``。
+          注册后回查路由表:该路由若没生效,autobot 控制台的 `/proxy/vr/{id}/_aux_ws`
+          桥接会握手失败并约每秒重连一次(现象:电量完全不刷新),必须能在日志里看到。
         """
         try:
             from aiohttp import web  # noqa: WPS433 (local import: aiohttp 是可选依赖)
@@ -1966,9 +2146,24 @@ class TeleVuer:
         try:
             self.vuer.app.router.add_get("/ws/aux", self._handle_aux_ws)
             self.vuer.app.router.add_get("/_aux_info", self._aux_info_probe)
-            logging.info("[TeleVuer] /ws/aux registered on aiohttp router")
         except Exception as exc:  # noqa: BLE001
-            logging.warning("[TeleVuer] /ws/aux registration failed: %s", exc)
+            logging.error(
+                "[TeleVuer] /ws/aux registration failed: %s —— 控制台电量通道将不可用", exc
+            )
+            return
+
+        try:
+            paths = {(route.get_info() or {}).get("path") for route in self.vuer.app.router.routes()}
+            if "/ws/aux" not in paths:
+                logging.error(
+                    "[TeleVuer] /ws/aux 不在 aiohttp 路由表中(可能被其它路由抢占),"
+                    "控制台电量通道不可用。当前路由: %s",
+                    sorted(p for p in paths if p),
+                )
+            else:
+                logging.info("[TeleVuer] /ws/aux registered on aiohttp router")
+        except Exception as exc:  # noqa: BLE001
+            logging.info("[TeleVuer] /ws/aux registered (路由表回查失败: %s)", exc)
 
     async def _aux_info_probe(self, request):
         """供前端探测辅助 WS 端点是否存在。"""
@@ -2002,6 +2197,20 @@ class TeleVuer:
             }
         )
 
+    def _battery_payload(self) -> dict:
+        """当前电量快照。
+
+        额外给出服务端算好的新鲜度(``ageMs`` / ``stale``):前端据此判断数据是否过期,
+        不必拿"机器人的 clock"和"运营电脑的 clock"直接相减 —— 两端时钟偏差会
+        直接把新鲜数据误判成"数据过期"(或反过来永远不过期)。
+        """
+        payload = dict(self._battery_state)
+        updated_at = int(payload.get("updatedAt") or 0)
+        payload["connected"] = bool(self._aux_ws_clients)
+        payload["ageMs"] = (int(time.time() * 1000) - updated_at) if updated_at > 0 else None
+        payload["stale"] = bool(payload["ageMs"] is not None and payload["ageMs"] > 30_000)
+        return payload
+
     def _battery_json(self) -> str:
         """返回最近一次浏览器上报的 PICO 头显电量。
 
@@ -2010,61 +2219,114 @@ class TeleVuer:
           charging    bool|None
           deviceName  str|None 头显型号 / 序列号
           updatedAt   int       上次更新时间(epoch ms),0 表示从未上报
+          ageMs       int|None  距上次上报的毫秒数(服务端计算,前端优先用它)
           source      str       none/browser/fallback
+          reportedBy  str|None 上报方的 User-Agent(诊断"谁在报电量")
           connected   bool      是否有活跃 ws 客户端
+          stale       bool      数据是否已超过 30s 未刷新
         """
-        connected = bool(self._aux_ws_clients)
-        payload = dict(self._battery_state)
-        payload["connected"] = connected
-        payload["stale"] = payload["updatedAt"] > 0 and (time.time() * 1000 - payload["updatedAt"]) > 30_000
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(self._battery_payload(), ensure_ascii=False)
 
     async def _handle_aux_ws(self, request):
         """处理 /ws/aux 升级请求;内部协议是 JSON 文本消息。"""
         from aiohttp import web
 
+        ua = request.headers.get("User-Agent", "") or ""
+        headset = _is_headset_ua(ua)
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
         self._aux_ws_clients.add(ws)
+        self._aux_ws_meta[id(ws)] = {"ua": ua, "headset": headset, "device": _device_type_from_ua(ua)}
+        if not headset:
+            logging.info(
+                "[TeleVuer] /ws/aux 客户端 %s 不是头显,只允许订阅、忽略其电量上报: %s",
+                _device_type_from_ua(ua), ua[:120],
+            )
         try:
             # 上线时立即推送当前电量快照
-            snapshot = dict(self._battery_state)
+            snapshot = self._battery_payload()
             snapshot["connected"] = True
-            await ws.send_str(json.dumps({"type": "battery-snapshot", "data": snapshot}))
+            await ws.send_str(json.dumps({"type": "battery-snapshot", "data": snapshot}, ensure_ascii=False))
             async for msg in ws:
                 if msg.type == web.WSMsgType.TEXT:
                     try:
                         payload = json.loads(msg.data)
                     except json.JSONDecodeError:
                         continue
-                    self._handle_aux_message(payload)
+                    self._handle_aux_message(payload, ws)
                 elif msg.type == web.WSMsgType.ERROR:
                     break
         finally:
             self._aux_ws_clients.discard(ws)
+            self._aux_ws_meta.pop(id(ws), None)
             await ws.close()
 
-    def _handle_aux_message(self, payload: dict) -> None:
-        """处理来自浏览器侧的辅助消息(目前只关心电量)。"""
+    def _handle_aux_message(self, payload: dict, ws=None) -> None:
+        """处理来自浏览器侧的辅助消息(目前只关心电量)。
+
+        电量只接受"头显类客户端"的上报:桌面浏览器(运营电脑,通常插电 = 100%)直接
+        打开 8012 页面时会上报本机电量,与头显真实电量交替覆盖缓存,表现为控制台
+        电量在两个数之间跳变 —— 这是 2026-09-19 修复的核心问题。
+        """
         mtype = payload.get("type")
-        if mtype == "battery-update":
-            data = payload.get("data") or {}
-            self._update_battery_state({**data, "source": "browser"})
+        if mtype != "battery-update":
+            # 其它类型(例如前端用于保活的 ping)直接忽略。
+            return
+        meta = self._aux_ws_meta.get(id(ws)) if ws is not None else None
+        if meta is not None and not meta.get("headset"):
+            ua = meta.get("ua", "")
+            if ua not in self._battery_rejected_ua:
+                self._battery_rejected_ua.add(ua)
+                logging.warning(
+                    "[TeleVuer] 已忽略非头显客户端(%s)的电量上报:%s。"
+                    "若确认该设备就是头显,可设 XR_TELEOP_BATTERY_ALLOW_ANY_UA=1 放开。",
+                    meta.get("device") or _device_type_from_ua(ua), ua[:120],
+                )
+            return
+        data = payload.get("data") or {}
+        self._update_battery_state(
+            {**data, "source": "browser", "reportedBy": (meta or {}).get("ua") or None}
+        )
 
     def _update_battery_state(self, new_state: dict) -> None:
+        """合并一次电量上报(无效字段不覆盖已有值,并广播给所有订阅者)。"""
+        level = new_state.get("level")
+        charging = new_state.get("charging")
+        device_name = new_state.get("deviceName")
+
+        if isinstance(level, bool) or not isinstance(level, (int, float)) or not math.isfinite(float(level)):
+            level = None
+        else:
+            level = max(0, min(100, int(round(float(level)))))
+        if not isinstance(charging, bool):
+            charging = None
+        if not isinstance(device_name, str) or not device_name.strip():
+            device_name = None
+
+        if level is None and charging is None and device_name is None:
+            logging.debug("[TeleVuer] 丢弃一次没有有效字段的电量上报: %s", new_state)
+            return
+
         with self._aux_lock:
-            self._battery_state.update(
-                {
-                    k: new_state.get(k, self._battery_state.get(k))
-                    for k in ("level", "charging", "deviceName")
-                }
-            )
+            # 只在字段有效时更新:避免一次缺字段的上报把已知电量清空(前端会表现为
+            # "电量未上报"与真实数值交替闪烁)。
+            if level is not None:
+                self._battery_state["level"] = level
+            if charging is not None:
+                self._battery_state["charging"] = charging
+            if device_name is not None:
+                self._battery_state["deviceName"] = device_name
             self._battery_state["updatedAt"] = int(time.time() * 1000)
-            self._battery_state["source"] = new_state.get("source", self._battery_state.get("source", "browser"))
+            self._battery_state["source"] = (
+                new_state.get("source") or self._battery_state.get("source") or "browser"
+            )
+            if new_state.get("reportedBy"):
+                self._battery_state["reportedBy"] = new_state["reportedBy"]
+
         # 异步广播给其它订阅者
-        snapshot = dict(self._battery_state)
+        snapshot = self._battery_payload()
         snapshot["connected"] = True
-        msg = json.dumps({"type": "battery-snapshot", "data": snapshot})
+        msg = json.dumps({"type": "battery-snapshot", "data": snapshot}, ensure_ascii=False)
         dead: list = []
         for ws in list(self._aux_ws_clients):
             try:
@@ -2074,3 +2336,4 @@ class TeleVuer:
                 dead.append(ws)
         for ws in dead:
             self._aux_ws_clients.discard(ws)
+            self._aux_ws_meta.pop(id(ws), None)

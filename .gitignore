@@ -23,6 +23,8 @@ teleop/data/
 episode_0*
 .vscode/
 *.pkl
+# 前端构建产物(由 scripts 生成,不入库)
+dist/
 # 保留 vendor 目录结构（相机 SDK + 运行时库）
 !teleop/teleimager/vendor/
 !teleop/teleimager/vendor/camera_sdk_test/build/*.so

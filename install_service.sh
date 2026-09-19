@@ -241,6 +241,10 @@ EOF
     # 3. 权限
     chown -R "${SERVICE_USER}:${SERVICE_USER}" "$PAYLOAD" 2>/dev/null || true
     find "$PAYLOAD/scripts" -type f -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
+    # 部署包是在 Windows 上打包的：解压后文件没有 unix 执行位（666，目录 777），
+    # 而 scam 后端的 glibc-2.35 加载器（vendor/glibc235/.../ld-linux-aarch64.so.1）必须可执行，
+    # 否则 start_teleimager.sh 只能回退到系统上的 /home/unitree/glibc235。这里统一补上。
+    find "$PAYLOAD/teleop/teleimager/vendor" -name 'ld-linux*.so*' -exec chmod 755 {} + 2>/dev/null || true
 
     # 4. 管理 CLI(把 PROJECT_ROOT 指向本次 payload,使 install-env 也能用)
     local cli_src="$PAYLOAD/.deb-build/usr/bin/xr-teleop-control"
