@@ -1154,6 +1154,21 @@ class BaseCamera:
         else:
             self._webrtc_buffer = None
 
+        # ---- 立体分屏（stereo_split_webrtc）相关属性：基类统一默认关闭 ----
+        # 基类的 get_bgr_frame() / get_bgr_frame_left() / get_bgr_frame_right() /
+        # get_webrtc_port() 会直接读取下面这几个字段。它们原先只在 OpenCVCamera.__init__
+        # 里赋值，于是 RealSenseCamera / UVCCamera 一调用 get_bgr_frame() 就抛
+        # AttributeError: 'RealSenseCamera' object has no attribute '_stereo_split_webrtc'；
+        # 该异常又被 _webrtc_pub() 的 except 吞掉（只记固定文案不记异常），
+        # 现场表现是 "[Image Server] Failed to publish rtc frame from xxx camera." 之后
+        # _stop_event.set() → 服务立即退出 → systemd 反复重启，极难定位。
+        # 这里在基类给全默认值；OpenCVCamera 会在自己的 __init__ 中按配置覆盖。
+        self._stereo_split_webrtc = False
+        self._webrtc_buffer_left = None
+        self._webrtc_buffer_right = None
+        self._webrtc_port_left = webrtc_port
+        self._webrtc_port_right = webrtc_port
+
     def __str__(self):
         raise NotImplementedError
     
@@ -1917,7 +1932,11 @@ class ImageServer:
                 try:
                     camera._update_frame()
                 except Exception as e:
-                    logger_mp.error(f"[Image Server] Error updating frame for {cam_topic} camera: {e}")
+                    logger_mp.error(
+                        f"[Image Server] Error updating frame for {cam_topic} camera: "
+                        f"{type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
                     self._stop_event.set()
                     break
                 next_frame_time += interval
@@ -1951,7 +1970,13 @@ class ImageServer:
                 else:
                     next_frame_time = time.monotonic()
         except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to publish zmq frame from {cam_topic} camera.")
+            # 必须带上异常本身：原先只记固定文案，真实原因（例如 AttributeError）被吞掉，
+            # 现场只能看到"Failed to publish zmq frame"而无法定位。
+            logger_mp.error(
+                f"[Image Server] Failed to publish zmq frame from {cam_topic} camera: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
             self._stop_event.set()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
@@ -1987,7 +2012,12 @@ class ImageServer:
                 else:
                     next_frame_time = time.monotonic()
         except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to publish rtc frame from {cam_topic} camera.")
+            # 同 _zmq_pub：把异常类型与内容、堆栈一并打出，避免真实原因被吞掉。
+            logger_mp.error(
+                f"[Image Server] Failed to publish rtc frame from {cam_topic} camera: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
             self._stop_event.set()
 
     def _clean_up(self):

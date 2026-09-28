@@ -11,10 +11,19 @@
 # 用法：
 #   bash scripts/start_teleimager.sh                 # 前台启动（默认，与原行为一致）
 #   bash scripts/start_teleimager.sh --restart       # 停掉旧实例后启动
+#   bash scripts/start_teleimager.sh --find-camera   # 列出所有 V4L2 相机及 sysfs 路径（填 physical_path 用）
 #   RELOAD_UVC=1 bash scripts/start_teleimager.sh    # 启动前重载 uvcvideo 驱动
 #   DAEMON=1 bash scripts/start_teleimager.sh        # nohup 后台启动
 #   CAM_BACKEND=scam bash scripts/start_teleimager.sh  # 用 glibc-2.35 包装运行（SCAM SDK）
 #   bash scripts/start_teleimager.sh                 # 默认按 cam_config_server.yaml 的 type 自动选择
+#
+# SCAM → RealSense 自动回退的两处历史误判（2026-09-28 修复）：
+#   1) physical_path 填的是 USB Hub 的接口路径。Hub 的 sysfs 路径永远存在，
+#      原逻辑只判断「路径存在」就认定相机在位 → 永远不回退 → SCAM SDK 反复崩溃。
+#      现要求 physical_path 必须是真实相机接口（含 video4linux/ 子目录或 bInterfaceClass=0e）。
+#   2) video_id 与 RealSense 的节点号冲突。RealSense 重新枚举后会占用任意 /dev/videoN
+#      （包括原本留给 SCAM 的 6），原逻辑只判断「/dev/videoN 存在」就认定相机在位。
+#      现在会先确认该节点不属于 RealSense（USB VID 8086）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +38,133 @@ RESTART=""
 DAEMON="${DAEMON:-0}"               # 1 => nohup 后台
 RELOAD_UVC="${RELOAD_UVC:-0}"       # 1 => modprobe -r + 重载 uvcvideo（默认不重载）
 CAM_BACKEND="${CAM_BACKEND:-auto}" # auto | opencv | scam
+
+# ---- 相机探测辅助函数 ------------------------------------------------------
+#
+# 只依赖 sysfs，不依赖 python / conda（conda 环境在本步之后才激活）。
+
+# 判断一个 sysfs 路径是否真的是「相机接口」。
+# 真实 V4L2/UVC 相机接口目录下会有 video4linux/videoN 子目录，或接口类为 0x0e(Video)。
+# USB Hub 的接口目录（如 .../2-2.3/2-2.3:1.0）两者都没有 —— 这正是原逻辑把 Hub
+# 误判成「SCAM 相机在位」的根因（Hub 的 sysfs 路径永远存在，永远不会回退）。
+_is_video_interface() {
+  local p="${1:-}"
+  if [[ -z "$p" || ! -d "$p" ]]; then
+    return 1
+  fi
+
+  local v
+  for v in "$p"/video4linux/video*; do
+    if [[ -e "$v" ]]; then
+      return 0
+    fi
+  done
+
+  if [[ "$(cat "$p/bInterfaceClass" 2>/dev/null || true)" == "0e" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# 从 /sys/class/video4linux/videoN 向上回溯，打印所属 USB 设备的 idVendor。
+_usb_vendor_of_video() {
+  local vid="${1:-}"
+  local node="/sys/class/video4linux/video${vid}"
+  if [[ ! -e "$node" ]]; then
+    return 1
+  fi
+
+  local d
+  d="$(readlink -f "$node/device" 2>/dev/null || true)"
+  if [[ -z "$d" ]]; then
+    return 1
+  fi
+
+  while [[ "$d" != "/" && -n "$d" ]]; do
+    if [[ -r "$d/idVendor" ]]; then
+      cat "$d/idVendor" 2>/dev/null
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+# /dev/videoN 是否属于 RealSense（Intel，USB VID 8086）。
+# RealSense 重新枚举后会占用任意 /dev/videoN（包括原本留给 SCAM 的 6），必须排除。
+_is_realsense_video_node() {
+  local vid="${1:-}"
+  if [[ "$(_usb_vendor_of_video "$vid" || true)" == "8086" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# 是否存在 RealSense 深度相机（回退前做可用性提示用）。
+_has_realsense() {
+  local f d prod
+  for f in /sys/bus/usb/devices/*/idVendor; do
+    [[ -r "$f" ]] || continue
+    [[ "$(cat "$f" 2>/dev/null || true)" == "8086" ]] || continue
+    d="$(dirname "$f")"
+    prod="$(cat "$d/product" 2>/dev/null || true)"
+    case "$prod" in
+      *RealSense*|*Depth*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# --find-camera：列出所有 V4L2 相机及其 sysfs 接口路径，供填写 physical_path / video_id。
+find_cameras() {
+  echo "检测到的 V4L2 视频节点（用于填写 cam_config_server.yaml 的 physical_path / video_id）"
+  echo
+
+  local node name iface devpath vendor product kind found=0
+  for node in /sys/class/video4linux/video*; do
+    [[ -e "$node" ]] || continue
+    found=1
+    name="$(basename "$node")"
+    iface="$(readlink -f "$node/device" 2>/dev/null || true)"
+
+    devpath="$iface"; vendor=""; product=""
+    while [[ "$devpath" != "/" && -n "$devpath" ]]; do
+      if [[ -r "$devpath/idVendor" ]]; then
+        vendor="$(cat "$devpath/idVendor" 2>/dev/null || true)"
+        product="$(cat "$devpath/product" 2>/dev/null || true)"
+        break
+      fi
+      devpath="$(dirname "$devpath")"
+    done
+
+    if [[ "$vendor" == "8086" ]]; then
+      kind="RealSense"
+    else
+      kind="其他/候选"
+    fi
+
+    printf '  /dev/%-9s [%s]\n' "$name" "$kind"
+    printf '      接口路径 : %s\n' "${iface:-未知}"
+    printf '      USB      : %s %s\n\n' "${vendor:-未知}" "${product:-未知设备}"
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "  未发现任何 /dev/video* 节点。请确认相机已插好、驱动已加载。" >&2
+  fi
+
+  echo "填写方法："
+  echo "  1) 找到 SCAM 立体相机那一行（非 RealSense），把它的「接口路径」填入"
+  echo "     cam_config_server.yaml 的 head_camera.physical_path；"
+  echo "  2) 同时把 head_camera.video_id 填成它的 /dev/videoN 编号；"
+  echo "  3) physical_path 留空时脚本会退化为按 video_id 判断（须确保该节点不属于 RealSense）。"
+}
+
+case "${1:-}" in
+  --find-camera|--cf)
+    find_cameras
+    exit 0
+    ;;
+esac
 
 # 默认根据当前 teleimager 配置选择后端，避免 type: scam 时误用系统 glibc 启动。
 # 显式 CAM_BACKEND=opencv/scam 仍可覆盖自动判断。
@@ -69,13 +205,35 @@ detect_camera_fallback() {
   local video_id physical_path
   video_id=$(sed -n 's/^[[:space:]]*video_id:[[:space:]]*\([0-9]\+\).*/\1/p' "$config_file" | head -n1)
   physical_path=$(sed -n 's/^[[:space:]]*physical_path:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$config_file" | head -n1 | tr -d "'\"")
+  # 占位值（null/none）视为「未配置」
+  case "$physical_path" in
+    ""|null|none|NULL|None) physical_path="" ;;
+  esac
 
   local stereo_available=0
-  if [[ -n "$video_id" && -e "/dev/video${video_id}" ]]; then
-    stereo_available=1
+
+  # ① physical_path 是权威定位：必须是「真实相机接口」。
+  #    原逻辑只判断「路径存在」，于是填了 USB Hub 的接口路径时永远判定相机在位，
+  #    自动回退被跳过，SCAM SDK 反复崩溃 —— 这是本次线上故障的根因之一。
+  if [[ -n "$physical_path" ]]; then
+    if _is_video_interface "$physical_path"; then
+      stereo_available=1
+    elif [[ -e "$physical_path" ]]; then
+      echo "[teleimager] 警告：physical_path 存在但不是相机接口，已忽略：$physical_path" >&2
+      echo "[teleimager]       多半是误填了 USB Hub 的接口路径（Hub 路径永远存在）。" >&2
+      echo "[teleimager]       用 'bash $0 --find-camera' 查看真实相机接口路径。" >&2
+    fi
   fi
-  if [[ "$stereo_available" -eq 0 && -n "$physical_path" && -e "$physical_path" ]]; then
-    stereo_available=1
+
+  # ② video_id 兜底：节点存在，且不属于 RealSense。
+  #    RealSense 重新枚举后会占用任意 /dev/videoN（含原本留给 SCAM 的 6），
+  #    只看「节点存在」会把 RealSense 误判成 SCAM 立体相机 —— 根因之二。
+  if [[ "$stereo_available" -eq 0 && -n "$video_id" && -e "/dev/video${video_id}" ]]; then
+    if _is_realsense_video_node "$video_id"; then
+      echo "[teleimager] 提示：/dev/video${video_id} 属于 RealSense，不作为 SCAM 相机在位的依据。" >&2
+    else
+      stereo_available=1
+    fi
   fi
 
   if [[ "$stereo_available" -eq 1 ]]; then
@@ -87,6 +245,11 @@ detect_camera_fallback() {
   if [[ ! -f "$rs_config" ]]; then
     echo "[teleimager] 错误：未找到回退配置 $rs_config" >&2
     return 1
+  fi
+
+  if ! _has_realsense; then
+    echo "[teleimager] 警告：也未检测到 RealSense 深度相机，回退后仍可能启动失败。" >&2
+    echo "[teleimager]       请接入 SCAM 立体相机或 RealSense 深度相机后重试。" >&2
   fi
 
   echo "[teleimager] 自动回退到 RealSense 深度相机配置: $rs_config" >&2

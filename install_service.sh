@@ -26,6 +26,9 @@
 #   xr-teleimager  头部双目相机 WebRTC 图像服务(60001);「服务开关」与「开机自启」目标
 #   xr-heartbeat   本机 wlan0 地址心跳上报(把地址报给 autobot-guide-service)
 #
+# 另有一个内部子命令(不面向部署器,由 xr-teleimager.service 的 ExecStartPre 以 root 调用):
+#   tune-usb       写 RealSense 必需的 USB 内核参数(usbfs_memory_mb=1000 等)
+#
 # 两种包形态共用本脚本,脚本自行定位 payload:
 #   deb : <root>/opt/xr-teleoperate-main/   (dpkg-deb -x 解出的目录树)
 #   zip : <root>/                            (解压后即为 payload 根)
@@ -46,18 +49,73 @@ UNIT_DIR="/etc/systemd/system"
 LOG_DIR="/var/log/xr-teleoperate"
 SERVICE_USER="unitree"
 
+# ---------------------------------------------------------------------------
+# tune-usb：RealSense 取流必需的 USB 内核参数
+# ---------------------------------------------------------------------------
+# 背景(2026-09-28 线上故障)：RealSense 在 Linux 上要求 usbfs 内存上限 >= 1000MB，
+# 内核默认只有 16MB，上限过小会依次表现为：
+#   dmesg : uvcvideo: Failed to resubmit video URB (-1)
+#   dmesg : usb 2-2.1: reset SuperSpeed Gen 1 USB device
+#   应用  : [Image Server] Error updating frame for head_camera camera:
+#           RuntimeError: Frame didn't arrive within 5000
+# 最终图像服务在运行几分钟后自杀、被 systemd 反复重启。
+#
+# usbcore 在 Jetson(Tegra)上是内建模块而不是 .ko，/etc/modprobe.d 的 options 不生效，
+# 只能直接写 sysfs；而 sysfs 这两个文件都只有 root 能写，所以由 xr-teleimager.service
+# 的 ExecStartPre 以 root 执行本子命令(unit 里用 "+" 前缀无视 User= 提权)。
+#
+# 注意：本函数始终返回 0 —— 它是服务启动的前置步骤，调优失败不应该阻断服务启动，
+# 只在日志里留下明确告警(日志见 /var/log/xr-teleoperate/xr-teleimager.log)。
+tune_usb_for_realsense() {
+    local want_mb="${USBFS_MEMORY_MB:-1000}"
+    local param=/sys/module/usbcore/parameters/usbfs_memory_mb
+
+    if [[ -e "$param" ]]; then
+        local cur
+        cur="$(cat "$param" 2>/dev/null || echo '?')"
+        if [[ "$cur" == "$want_mb" ]]; then
+            echo "[tune-usb] usbfs_memory_mb 已是 $want_mb"
+        elif echo "$want_mb" > "$param" 2>/dev/null; then
+            echo "[tune-usb] usbfs_memory_mb: $cur -> $want_mb"
+        else
+            echo "[tune-usb] 警告：写入 usbfs_memory_mb 失败(需要 root)" >&2
+        fi
+    else
+        echo "[tune-usb] 跳过 usbfs_memory_mb：$param 不存在(非 Linux usbcore 环境?)"
+    fi
+
+    # 关闭 RealSense 的 USB 自动挂起：相机空闲时被内核挂起后恢复取流可能失败。
+    # 机器人上 8086(Intel)只有 RealSense 这一颗 USB 设备，按 VID 匹配即可。
+    local f dev tuned=0
+    for f in /sys/bus/usb/devices/*/idVendor; do
+        [[ -r "$f" ]] || continue
+        [[ "$(cat "$f" 2>/dev/null || true)" == "8086" ]] || continue
+        dev="${f%/idVendor}"
+        if [[ -w "$dev/power/control" ]] && echo on > "$dev/power/control" 2>/dev/null; then
+            echo "[tune-usb] $(basename "$dev") power/control -> on"
+            tuned=1
+        fi
+    done
+    [[ "$tuned" -eq 1 ]] || echo "[tune-usb] 未发现 RealSense USB 设备，已跳过电源管理调整"
+
+    return 0
+}
+
 usage() {
     cat <<EOF
 用法:
     $0 <install|uninstall|status> --root <deploy-dir>
+    $0 tune-usb
 
 必传参数:
-    --root <deploy-dir>   CardModule 解压后的部署根目录
+    --root <deploy-dir>   CardModule 解压后的部署根目录(install/uninstall/status 必填)
 
 子命令语义:
     install     安装/刷新 unit 并启动 ${SERVICE_SWITCH_SERVICE}(不登记开机自启;不涉及 xr-teleop)
     uninstall   取消 ${SERVICE_SWITCH_SERVICE} 开机自启(不 stop)
     status      输出 ${SERVICES[*]} 的 active/enabled 状态
+    tune-usb    写 RealSense 必需的 USB 内核参数(usbfs_memory_mb=1000、关闭 USB 自动挂起)。
+                内部子命令,由 xr-teleimager.service 的 ExecStartPre 以 root 调用,需 root 权限。
 
 说明:
     scripts/start_xr_teleop.sh 属于高危脚本,不生成 unit、不 enable、不 start,
@@ -65,10 +123,11 @@ usage() {
 
 可选环境变量:
     XR_TELEOP_INSTALL_ENV=1   安装时顺带创建 conda 环境 tv(耗时较长)
+    USBFS_MEMORY_MB           tune-usb 使用的 usbfs 内存上限,默认 1000(MB)
 EOF
 }
 
-if [[ $# -lt 2 ]]; then
+if [[ $# -lt 1 ]]; then
     usage
     exit 1
 fi
@@ -91,6 +150,12 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# tune-usb 是内部子命令，不需要部署目录（由 xr-teleimager.service 的 ExecStartPre 调用）。
+if [[ "$ACTION" == "tune-usb" ]]; then
+    tune_usb_for_realsense
+    exit $?
+fi
 
 if [[ -z "$ROOT_DIR" ]]; then
     echo "缺少 --root 参数" >&2
@@ -158,6 +223,16 @@ write_units() {
         echo "[install_service] 已移除历史残留的高危 unit: xr-teleop.service(仅允许手动启动 start_xr_teleop.sh)"
     fi
 
+    # 刻意不生成 xr-usb-tuning.service（历史版本曾用过）：RealSense 需要的 USB 内核参数
+    # 改由下面 xr-teleimager 的 ExecStartPre 直接调用本脚本的 tune-usb 子命令完成，
+    # 少一个 unit、也少一个独立脚本文件。这里顺带清理升级场景可能残留的旧 unit。
+    if [[ -f "$UNIT_DIR/xr-usb-tuning.service" ]]; then
+        systemctl stop xr-usb-tuning 2>/dev/null || true
+        systemctl disable xr-usb-tuning 2>/dev/null || true
+        rm -f "$UNIT_DIR/xr-usb-tuning.service"
+        echo "[install_service] 已移除历史残留的 xr-usb-tuning.service（逻辑已并入 ExecStartPre）"
+    fi
+
     cat > "$UNIT_DIR/xr-teleimager.service" <<EOF
 [Unit]
 Description=XR Teleimager (Image Server) - 60001
@@ -169,6 +244,11 @@ Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${payload}
 EnvironmentFile=-${ENV_FILE}
+# RealSense 要求 usbfs 内存上限 >= 1000MB（内核默认 16MB），过小会导致
+# "Failed to resubmit video URB" / "Frame didn't arrive within 5000" / USB 链路复位，
+# 图像服务跑几分钟后自杀。usbcore 在 Jetson 上是内建模块（modprobe.d 不生效），
+# 且相关 sysfs 只有 root 能写 —— 故用 "+" 前缀无视 User= 提权执行 tune-usb 子命令。
+ExecStartPre=+/bin/bash ${payload}/install_service.sh tune-usb
 ExecStart=${payload}/scripts/start_teleimager.sh
 Restart=on-failure
 RestartSec=5
@@ -257,6 +337,9 @@ EOF
     # 5. 写 unit(xr-teleimager / xr-heartbeat;不生成 xr-teleop)
     write_units "$PAYLOAD"
     systemctl daemon-reload
+
+    # 注：RealSense 的 USB 内核参数不需要在这里单独处理 —— 第 7 步 restart xr-teleimager
+    #     时，unit 的 ExecStartPre 会自动以 root 跑一次 tune-usb。
 
     # 6. 高危脚本:scripts/start_xr_teleop.sh 不生成 unit、不 enable、不 start。
     #    它只在现场需要遥操作时由人工单独执行:

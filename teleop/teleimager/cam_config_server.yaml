@@ -30,9 +30,19 @@ head_camera:
   webrtc_port_left: 60001
   webrtc_port_right: 60002
   fps: 30
+  # video_id：SCAM 相机枚举出的 /dev/videoN 编号（弱信号，physical_path 优先）。
+  #   注意：RealSense 重新枚举后会占用任意 /dev/videoN（包括这里填的 6），
+  #   启动脚本会自动排除属于 RealSense（USB VID 8086）的节点，不会被误判。
   video_id: 6
   serial_number: null
-  physical_path: /sys/devices/platform/3610000.xhci/usb2/2-2/2-2.3/2-2.3:1.0
+  # physical_path：SCAM 相机的 sysfs 接口路径（权威定位，优先于 video_id）。
+  #   ⚠ 必须填「相机接口」路径（该目录下有 video4linux/videoN 子目录），
+  #     不要填 USB Hub 的接口路径（例如 .../2-2.3/2-2.3:1.0）——
+  #     Hub 的 sysfs 路径永远存在，会导致「相机在位」判断永远为真、无法回退到 RealSense，
+  #     进而按 SCAM 启动并反复崩溃（2026-09-28 线上故障根因）。
+  #   查真实路径：bash scripts/start_teleimager.sh --find-camera
+  #   留空/null 时退化为只按 video_id 判断。
+  physical_path: null
   # ---------------- IMU 电子防抖（EIS） ----------------
   stabilization:
     enabled: true

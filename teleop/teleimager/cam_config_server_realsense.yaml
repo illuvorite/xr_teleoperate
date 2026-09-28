@@ -9,7 +9,13 @@ head_camera:
   binocular: false
   fps: 30
   video_id: null
-  serial_number: '349522071964'
+  # serial_number：留 null 表示自动选择（机器上只有一台 RealSense 时推荐）。
+  #   ⚠ 若确实要锁定某台相机，这里必须填 pyrealsense2 枚举出的 ASIC 序列号，例如：
+  #       python -c "import pyrealsense2 as rs;print([d.get_info(rs.camera_info.serial_number) for d in rs.context().query_devices()])"
+  #     注意它和 /sys/bus/usb/devices/*/serial 里的 USB 描述符序列号**不是同一个值**
+  #     （同一台 D435i：SDK 报 243622071728，sysfs 报 252943060513），填错会导致
+  #     "[Image Server] Cannot find RealSenseCamera for head_camera" 并反复重启。
+  serial_number: null
   physical_path: null
 
 left_wrist_camera:
