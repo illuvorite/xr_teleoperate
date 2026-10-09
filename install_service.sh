@@ -26,6 +26,11 @@
 #   xr-teleimager  头部双目相机 WebRTC 图像服务(60001);「服务开关」与「开机自启」目标
 #   xr-heartbeat   本机 wlan0 地址心跳上报(把地址报给 autobot-guide-service)
 #
+# dex1-1 夹爪服务刻意不做 systemd 常驻单元：它由 scripts/start_xr_teleop.sh 在启动
+# 遥操前判重拉起(并先发一次 status=7 清电机锁存故障)。本脚本只负责把 unitree 加进
+# dialout 组 —— /dev/ttyUSB* 属主是 root:dialout，而 unitree 默认不在该组，
+# 不加组时夹爪服务打不开串口，遥操会卡在 "Waiting to subscribe dds..."。
+#
 # 另有一个内部子命令(不面向部署器,由 xr-teleimager.service 的 ExecStartPre 以 root 调用):
 #   tune-usb       写 RealSense 必需的 USB 内核参数(usbfs_memory_mb=1000 等)
 #
@@ -321,6 +326,22 @@ EOF
     # 3. 权限
     chown -R "${SERVICE_USER}:${SERVICE_USER}" "$PAYLOAD" 2>/dev/null || true
     find "$PAYLOAD/scripts" -type f -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
+    # 夹爪服务(third_party/dex1_1_service)由 start_xr_teleop.sh 以 unitree 身份拉起,
+    # 需要读写 /dev/ttyUSB*(root:dialout, 660)。unitree 默认不在 dialout 组,
+    # 这里补上;之后 sudo -u unitree 起的新会话就会带上该组。
+    if getent group dialout >/dev/null 2>&1; then
+        if id -nG "$SERVICE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx dialout; then
+            echo "[install_service] $SERVICE_USER 已在 dialout 组"
+        elif usermod -aG dialout "$SERVICE_USER" 2>/dev/null; then
+            echo "[install_service] 已把 $SERVICE_USER 加入 dialout 组(夹爪串口权限)"
+        else
+            echo "[install_service] WARN: 加入 dialout 组失败,夹爪可能打不开 /dev/ttyUSB*" >&2
+        fi
+    fi
+    # 预编译的 arm64 产物:补执行位(部署包在 Windows 上打包,解压后没有 unix 执行位)
+    if [[ -d "$PAYLOAD/third_party/dex1_1_service/bin" ]]; then
+        chmod +x "$PAYLOAD/third_party/dex1_1_service/bin/"* 2>/dev/null || true
+    fi
     # 部署包是在 Windows 上打包的：解压后文件没有 unix 执行位（666，目录 777），
     # 而 scam 后端的 glibc-2.35 加载器（vendor/glibc235/.../ld-linux-aarch64.so.1）必须可执行，
     # 否则 start_teleimager.sh 只能回退到系统上的 /home/unitree/glibc235。这里统一补上。

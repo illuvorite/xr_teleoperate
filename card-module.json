@@ -8,7 +8,7 @@
   "version": "1.0.0",
   "arch": ["arm64"],
   "type": "python",
-  "description": "XR 遥操作主程序（Unitree G1_29）。部署后注册 xr-teleimager、xr-heartbeat 两个服务；遥操作主程序只允许手动启动。",
+  "description": "XR 遥操作主程序（Unitree G1_29）。部署后注册 xr-teleimager、xr-heartbeat 两个服务；遥操作主程序只允许手动启动。包内自带 dex1-1 夹爪服务（third_party/dex1_1_service，含预编译 arm64 产物），由 start_xr_teleop.sh 在启动遥操前判重拉起，无需单独安装。",
 
   "packageType": "zip",
   "whitelist": true,
