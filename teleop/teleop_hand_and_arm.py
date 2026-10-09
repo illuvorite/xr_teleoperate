@@ -209,7 +209,8 @@ if __name__ == '__main__':
             dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
             dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
             gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
-                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim)
+                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim,
+                                                     input_mode=args.input_mode)
         elif args.ee == "inspire_dfx":
             from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]

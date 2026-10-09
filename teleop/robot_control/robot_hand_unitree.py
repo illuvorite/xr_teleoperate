@@ -231,7 +231,7 @@ kTopicGripperRightState = "rt/dex1/right/state"
 
 class Dex1_1_Gripper_Controller:
     def __init__(self, left_gripper_value_in, right_gripper_value_in, dual_gripper_data_lock = None, dual_gripper_state_out = None, dual_gripper_action_out = None, 
-                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False):
+                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, input_mode = "controller"):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -250,6 +250,9 @@ class Dex1_1_Gripper_Controller:
         Unit_Test: Whether to enable unit testing
 
         simulation_mode: Whether to use simulation mode (default is False, which means using real robot)
+
+        input_mode: XR input source, "controller" (trigger, 10.0 open -> 0.0 closed) or "hand" (thumb-index distance in cm, ~15.0 open -> 0.0 pinched).
+                    The two sources have different value ranges, so the input->motor mapping range is selected accordingly.
         """
 
         logger_mp.info("Initialize Dex1_1_Gripper_Controller...")
@@ -258,6 +261,7 @@ class Dex1_1_Gripper_Controller:
         self.Unit_Test = Unit_Test
         self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
+        self.input_mode = input_mode
         
         if filter and not self.simulation_mode:
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
@@ -319,8 +323,16 @@ class Dex1_1_Gripper_Controller:
                              dual_gripper_state_out = None, dual_gripper_action_out = None):
         self.running = True
         DELTA_GRIPPER_CMD = 0.18     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
-        THUMB_INDEX_DISTANCE_MIN = 5.0
-        THUMB_INDEX_DISTANCE_MAX = 7.0
+        # 输入量程按 XR 输入来源区分，两者数值范围不同，不能共用一组常数：
+        #   controller 手柄扳机：tv_wrapper 输出 10.0(松开) -> 0.0(按到底)，用 [0, 10] 吃满整个扳机行程；
+        #   hand 手势捏合：tv_wrapper 输出拇指-食指距离(cm) ~15.0(张开) -> 0.0(捏合)，用 [5, 7] 让抓取段更灵敏。
+        if self.input_mode == "hand":
+            THUMB_INDEX_DISTANCE_MIN = 5.0
+            THUMB_INDEX_DISTANCE_MAX = 7.0
+        else:
+            THUMB_INDEX_DISTANCE_MIN = 0.0
+            THUMB_INDEX_DISTANCE_MAX = 10.0
+        gripper_input_initialized = False   # 收到首个非零输入前不要动，避免 VR 数据未就绪时乱抓
         LEFT_MAPPED_MIN  = 0.0           # The minimum initial motor position when the gripper closes at startup.
         RIGHT_MAPPED_MIN = 0.0           # The minimum initial motor position when the gripper closes at startup.
         # The maximum initial motor position when the gripper closes before calibration (with the rail stroke calculated as 0.6 cm/rad * 9 rad = 5.4 cm).
@@ -359,8 +371,13 @@ class Dex1_1_Gripper_Controller:
                 # get current dual gripper motor state
                 dual_gripper_state = np.array([left_gripper_state_value.value, right_gripper_state_value.value])
                 
-                if left_gripper_value != 0.0 or right_gripper_value != 0.0: # if input data has been initialized.
-                    # Linear mapping from [0, THUMB_INDEX_DISTANCE_MAX] to gripper action range
+                # 首次收到非零输入即认为 VR 数据已就绪；此后即使输入精确为 0.0（扳机按到底 / 完全捏合）
+                # 也要继续映射，否则夹爪会停在最后一个非零位置，无法完全闭合。
+                if not gripper_input_initialized:
+                    if left_gripper_value != 0.0 or right_gripper_value != 0.0:
+                        gripper_input_initialized = True
+                if gripper_input_initialized:
+                    # Linear mapping from the XR input range to the gripper action range
                     left_target_action  = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
                     right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
                 # clip dual gripper action to avoid overflow
@@ -430,7 +447,7 @@ if __name__ == "__main__":
         dual_gripper_data_lock = Lock()
         dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
         dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-        gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, dual_gripper_state_array, dual_gripper_action_array)
+        gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, dual_gripper_state_array, dual_gripper_action_array, input_mode=args.xr_mode)
 
     user_input = input("Please enter the start signal (enter 's' to start the subsequent program):\n")
     if user_input.lower() == 's':
