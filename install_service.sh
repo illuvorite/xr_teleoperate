@@ -253,6 +253,12 @@ EnvironmentFile=-${ENV_FILE}
 # "Failed to resubmit video URB" / "Frame didn't arrive within 5000" / USB 链路复位，
 # 图像服务跑几分钟后自杀。usbcore 在 Jetson 上是内建模块（modprobe.d 不生效），
 # 且相关 sysfs 只有 root 能写 —— 故用 "+" 前缀无视 User= 提权执行 tune-usb 子命令。
+# 相机独占：官方 master_service 会在 USB 相机出现后自动拉起 videohub_pc4，抓住
+# RealSense 的 /dev/video4 UVC 节点不放，导致 RealSense 初始化
+# xioctl(VIDIOC_S_FMT) Device or resource busy、本服务反复重启。
+# 故启动前先用 root 把它请走（方括号写法防 pkill 误杀自身命令行；
+# 本来就没在跑也视为成功）。一相机只能喂一路，遥操优先。
+ExecStartPre=+/bin/bash -c 'pkill -f "[v]ideohub_pc4 /dev/video4" || true; sleep 1; exit 0'
 ExecStartPre=+/bin/bash ${payload}/install_service.sh tune-usb
 ExecStart=${payload}/scripts/start_teleimager.sh
 Restart=on-failure
