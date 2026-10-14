@@ -1,0 +1,27 @@
+# 统一行尾策略：仓库内一律以 LF 存储，避免 IMU/operate 血统（CRLF）
+# 与 master/dev 血统（LF）跨血统合并时产生大量假冲突。
+# 目标平台为 Linux（Ubuntu 20.04 / aarch64 Jetson），LF 为正确选择。
+
+* text=auto eol=lf
+
+# Windows 侧脚本保持 CRLF，避免 cmd/PowerShell 解析异常
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源：显式声明，禁止行尾转换
+*.so     binary
+*.so.*   binary
+*.STL    binary
+*.stl    binary
+*.deb    binary
+*.pkl    binary
+*.zip    binary
+*.gz     binary
+*.tar.gz binary
+*.svo    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.mp4    binary
+*.webm   binary
+*.bin    binary
