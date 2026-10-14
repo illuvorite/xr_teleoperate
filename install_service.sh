@@ -322,6 +322,8 @@ do_install() {
 XR_TELEOP_ROBOT_ID=g1_001
 XR_TELEOP_PUBLIC_PORT=8012
 XR_TELEOP_HEARTBEAT_INTERVAL=30
+# 心跳上报目标(wanIp:port 是前端遥操直连模式的数据源,不可留空)
+XR_TELEOP_BACKEND_URL=https://hhqskj.com
 EOF
             echo "[install_service] 已生成默认 $ENV_FILE"
         fi

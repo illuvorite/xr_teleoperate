@@ -202,7 +202,11 @@ def main() -> int:
 
     # WAN_IP / ETH0_IP 允许缺省:缺失时自动检测,不再因为没配环境变量直接退出。
     resolve_addresses()
-    if not WAN_IP or WAN_IP.startswith("127."):
+    # 127.x 检查只针对"自动检测"结果(检测到回环说明网卡异常)。
+    # 显式配置 XR_TELEOP_WAN_IP=127.0.0.1 是合法用法:配合反向隧道(wstunnel/frp/SSH -R),
+    # 后端代理在本机连隧道端口即可到达机器人,此时 wanIp 就应该填回环地址。
+    explicit_wan = bool(os.environ.get("XR_TELEOP_WAN_IP", "").strip())
+    if not WAN_IP or (WAN_IP.startswith("127.") and not explicit_wan):
         print(
             "[heartbeat] FATAL: 无法确定对外网 IP(wlan0)。请检查机器人网络,"
             "或在 /etc/xr-teleoperate/env.conf 中显式设置 XR_TELEOP_WAN_IP。",
