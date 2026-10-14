@@ -18,6 +18,8 @@
   XR_TELEOP_ETH0_IP      eth0 IP(ROS/DDS,可选),留空同样自动检测。
   XR_TELEOP_PUBLIC_PORT  VR 对外端口,默认 8012
   XR_TELEOP_BACKEND_URL  后端地址,默认 http://127.0.0.1:19269
+  XR_TELEOP_ROBOT_TOKEN  后端 Sa-Token 机器人鉴权 token(可选)。
+                         留空时不带 Authorization 头,兼容未开启鉴权的后端。
   XR_TELEOP_HEARTBEAT_INTERVAL  心跳周期(秒),默认 30
 """
 from __future__ import annotations
@@ -41,6 +43,7 @@ WAN_IP = os.environ.get("XR_TELEOP_WAN_IP", "").strip()
 ETH0_IP = os.environ.get("XR_TELEOP_ETH0_IP", "").strip()
 PORT = int(os.environ.get("XR_TELEOP_PUBLIC_PORT", "8012"))
 BACKEND_URL = os.environ.get("XR_TELEOP_BACKEND_URL", "http://127.0.0.1:19269").rstrip("/")
+ROBOT_TOKEN = os.environ.get("XR_TELEOP_ROBOT_TOKEN", "").strip()
 INTERVAL = int(os.environ.get("XR_TELEOP_HEARTBEAT_INTERVAL", "30"))
 
 CACHE_FILE = Path(
@@ -172,6 +175,9 @@ def send_once() -> bool:
     body = json.dumps(payload).encode("utf-8")
     url = f"{BACKEND_URL}/api/v1/teleop/hosts/register"
     headers = {"Content-Type": "application/json"}
+    # 后端开启 Sa-Token 鉴权时携带 Bearer token;未配置则完全不带头,行为与旧版一致。
+    if ROBOT_TOKEN:
+        headers["Authorization"] = f"Bearer {ROBOT_TOKEN}"
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
@@ -217,7 +223,8 @@ def main() -> int:
 
     print(
         f"[heartbeat] starting: backend={BACKEND_URL} robot={ROBOT_ID} "
-        f"wan={WAN_IP} eth0={ETH0_IP or '<none>'} port={PORT} interval={INTERVAL}s",
+        f"wan={WAN_IP} eth0={ETH0_IP or '<none>'} port={PORT} interval={INTERVAL}s "
+        f"auth={'bearer' if ROBOT_TOKEN else 'none'}",
         flush=True,
     )
 

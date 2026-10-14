@@ -31,6 +31,9 @@ dist/
 teleop/teleimager/teleimager_auto.log
 teleop/teleimager/.teleimager_last_type
 teleop/teleimager/teleimager_auto_switcher.pid
+# 本地备份文件（IMU 分支曾误入库 *.bak，此处统一忽略）
+*.bak
+*.bak-*
 # 保留 vendor 目录结构（相机 SDK + 运行时库）
 !teleop/teleimager/vendor/
 !teleop/teleimager/vendor/camera_sdk_test/build/*.so
