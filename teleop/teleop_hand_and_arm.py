@@ -107,6 +107,8 @@ if __name__ == '__main__':
     logger_mp.info(f"[ip] img_server_ip resolved to: {args.img_server_ip}")
     logger_mp.info(f"args: {args}")
 
+    # 退出码：异常退出必须让 systemd/上层脚本感知，不能一律 exit(0)
+    exit_code = 0
     try:
         # setup dds communication domains id
         if args.sim:
@@ -130,6 +132,16 @@ if __name__ == '__main__':
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+
+        # 录制只从 ZMQ 通道拿图；webrtc-only 配置下不会崩溃，但也不会有图像。
+        # 这里提前告警，避免"录制成功但数据集里没有图"的静默问题。
+        if args.record:
+            for _cam in ('head_camera', 'left_wrist_camera', 'right_wrist_camera'):
+                _cfg = camera_config.get(_cam, {})
+                if not _cfg.get('enable_zmq', False):
+                    logger_mp.warning(
+                        f"[record] {_cam} has enable_zmq=false: no image frames will be saved for this camera."
+                    )
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         dashboard_config = None
@@ -291,6 +303,11 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        # 图像缓冲先置空：是否采集取决于 camera_config（例如默认配置是
+        # enable_zmq=false + enable_webrtc=true），录制分支必须能安全处理 None。
+        head_img = None
+        left_wrist_img = None
+        right_wrist_img = None
         # Keep an absolute schedule so work duration does not accumulate into
         # additional latency when a cycle overruns.
         control_period = 1.0 / args.frequency
@@ -356,7 +373,14 @@ if __name__ == '__main__':
                     STOP = True
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
-                    loco_wrapper.Damp()
+                    # 原实现调用 loco_wrapper.Damp()，但 LocoClientWrapper 只有
+                    # Enter_Damp_Mode()（内部才调 client.Damp()），因此软急停每次
+                    # 都抛 AttributeError -> 主循环退出 -> go_home。这里修正方法名，
+                    # 并保证阻尼失败不会连带杀死整个遥操循环。
+                    try:
+                        loco_wrapper.Enter_Damp_Mode()
+                    except Exception as e:
+                        logger_mp.error(f"Enter damp mode failed: {e}")
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
                 loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
                                   -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
@@ -540,6 +564,7 @@ if __name__ == '__main__':
     except Exception:
         import traceback
         logger_mp.error(traceback.format_exc())
+        exit_code = 1
     finally:
         try:
             arm_ctrl.ctrl_dual_arm_go_home()
@@ -585,4 +610,5 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
-        exit(0)
+        # 用退出码区分"正常按 q 退出"与"异常退出"，便于 systemd 重启策略/告警生效
+        sys.exit(exit_code)

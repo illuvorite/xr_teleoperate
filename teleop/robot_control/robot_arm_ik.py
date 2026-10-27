@@ -10,6 +10,53 @@ import sys
 import pickle
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
+
+# IK 出口的单周期最大关节步长（rad）。30Hz 下 0.05 rad/cycle ≈ 1.5 rad/s，
+# 与 robot_arm.py 的速度上限同量级；超过即视为求解跳变（奇异/肘部翻转）。
+IK_STEP_MAX = float(os.getenv("XR_IK_STEP_MAX", "0.05"))
+
+_ik_warn_ts = {}
+
+
+def _warn_ik(key: str, msg: str, period: float = 1.0) -> None:
+    """限流告警：求解失败可能以 30Hz 持续发生，不能每帧刷完整数组。"""
+    now = time.monotonic()
+    if now - _ik_warn_ts.get(key, 0.0) < period:
+        return
+    _ik_warn_ts[key] = now
+    logger_mp.error(f"[ik-safety] {msg}")
+
+
+def _sanitize_ik_solution(sol_q, current_q, model, step_max: float = IK_STEP_MAX):
+    """IK 出口硬闸门：有限性检查 -> 关节限位 clamp -> 单周期步长限制。
+
+    移动平均滤波只是平滑，不是限幅：一次 2~3 rad 的跳变会被分摊到 4 个周期，
+    在 30Hz 下仍相当于 20+ rad/s。这里在进滤波器之前就把跳变截断。
+    """
+    sol_q = np.asarray(sol_q, dtype=float)
+    current_q = np.asarray(current_q, dtype=float)
+
+    if sol_q.shape != current_q.shape:
+        _warn_ik("ik_shape", f"IK solution shape {sol_q.shape} != current {current_q.shape}")
+        return current_q.copy()
+    if not np.all(np.isfinite(sol_q)):
+        _warn_ik("ik_nan", "IK produced non-finite solution, holding position")
+        return current_q.copy()
+
+    lower = np.asarray(model.lowerPositionLimit, dtype=float)
+    upper = np.asarray(model.upperPositionLimit, dtype=float)
+    if lower.shape == sol_q.shape and upper.shape == sol_q.shape:
+        sol_q = np.clip(sol_q, lower, upper)
+
+    delta = sol_q - current_q
+    peak = float(np.max(np.abs(delta))) if delta.size else 0.0
+    if peak > step_max:
+        _warn_ik("ik_step", f"IK joint step {peak:.3f} rad > {step_max:.3f}, clamping")
+        sol_q = current_q + delta * (step_max / peak)
+
+    return sol_q
+
+
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
 
@@ -257,28 +304,39 @@ class G1_29_ArmIK:
         return robot_left_pose, robot_right_pose
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
-        if current_lr_arm_motor_q is not None:
-            self.init_data = current_lr_arm_motor_q
-        self.opti.set_initial(self.var_q, self.init_data)
+        # ---- 输入闸门：None / NaN 一律不进入求解器 ----
+        if current_lr_arm_motor_q is None:
+            raise ValueError("[IK] current_lr_arm_motor_q is required (pass measured joint q)")
+        current_lr_arm_motor_q = np.asarray(current_lr_arm_motor_q, dtype=float)
+        left_wrist = np.asarray(left_wrist, dtype=float)
+        right_wrist = np.asarray(right_wrist, dtype=float)
 
-        # left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
+        if not np.all(np.isfinite(current_lr_arm_motor_q)):
+            _warn_ik("q_nan", "measured joint q contains NaN/Inf, refusing to solve")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+        if not (np.all(np.isfinite(left_wrist)) and np.all(np.isfinite(right_wrist))):
+            _warn_ik("pose_nan", "XR wrist pose contains NaN/Inf, holding position")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+
+        self.init_data = current_lr_arm_motor_q
+
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization
 
-        self.opti.set_value(self.param_tf_l, left_wrist)
-        self.opti.set_value(self.param_tf_r, right_wrist)
-        self.opti.set_value(self.var_q_last, self.init_data) # for smooth
-
         try:
-            sol = self.opti.solve()
-            # sol = self.opti.solve_limited()
+            self.opti.set_initial(self.var_q, self.init_data)
+            self.opti.set_value(self.param_tf_l, left_wrist)
+            self.opti.set_value(self.param_tf_r, right_wrist)
+            self.opti.set_value(self.var_q_last, self.init_data) # for smooth
 
-            sol_q = self.opti.value(self.var_q)
+            self.opti.solve()
+
+            sol_q = np.asarray(self.opti.value(self.var_q), dtype=float)
+            sol_q = _sanitize_ik_solution(sol_q, current_lr_arm_motor_q, self.reduced_robot.model)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
             self._update_diagnostics(sol_q, solver_ok=True)
-
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
             else:
@@ -292,30 +350,13 @@ class G1_29_ArmIK:
                 self.vis.display(sol_q)  # for visualization
 
             return sol_q, sol_tauff
-        
+
         except Exception as e:
-            logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
-
-            sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
-            self._update_diagnostics(sol_q, solver_ok=False)
-
-            if current_lr_arm_motor_dq is not None:
-                v = current_lr_arm_motor_dq * 0.0
-            else:
-                v = (sol_q - self.init_data) * 0.0
-
-            self.init_data = sol_q
-
-            sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
-
-            logger_mp.error(f"sol_q:{sol_q} \nmotorstate: \n{current_lr_arm_motor_q} \nleft_pose: \n{left_wrist} \nright_pose: \n{right_wrist}")
-            if self.Visualization:
-                self.vis.display(sol_q)  # for visualization
-
-            # return sol_q, sol_tauff
-            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+            # 失败时保持当前实测位置，且不把失败迭代点写进 smooth_filter / init_data。
+            # 原实现用 opti.debug.value() 覆盖两者，下一帧从坏点热启动 -> 可能连续失败。
+            _warn_ik("solve_fail", f"IK failed, holding position: {e}")
+            self.init_data = current_lr_arm_motor_q.copy()
+            return current_lr_arm_motor_q.copy(), np.zeros(self.reduced_robot.model.nv)
 
     def _update_diagnostics(self, q, solver_ok):
         """Capture safety indicators without changing the control API."""
@@ -583,24 +624,36 @@ class G1_23_ArmIK:
         return robot_left_pose, robot_right_pose
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
-        if current_lr_arm_motor_q is not None:
-            self.init_data = current_lr_arm_motor_q
-        self.opti.set_initial(self.var_q, self.init_data)
+        # ---- 输入闸门：None / NaN 一律不进入求解器 ----
+        if current_lr_arm_motor_q is None:
+            raise ValueError("[IK] current_lr_arm_motor_q is required (pass measured joint q)")
+        current_lr_arm_motor_q = np.asarray(current_lr_arm_motor_q, dtype=float)
+        left_wrist = np.asarray(left_wrist, dtype=float)
+        right_wrist = np.asarray(right_wrist, dtype=float)
 
-        # left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
+        if not np.all(np.isfinite(current_lr_arm_motor_q)):
+            _warn_ik("q_nan", "measured joint q contains NaN/Inf, refusing to solve")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+        if not (np.all(np.isfinite(left_wrist)) and np.all(np.isfinite(right_wrist))):
+            _warn_ik("pose_nan", "XR wrist pose contains NaN/Inf, holding position")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+
+        self.init_data = current_lr_arm_motor_q
+
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization
 
-        self.opti.set_value(self.param_tf_l, left_wrist)
-        self.opti.set_value(self.param_tf_r, right_wrist)
-        self.opti.set_value(self.var_q_last, self.init_data) # for smooth
-
         try:
-            sol = self.opti.solve()
-            # sol = self.opti.solve_limited()
+            self.opti.set_initial(self.var_q, self.init_data)
+            self.opti.set_value(self.param_tf_l, left_wrist)
+            self.opti.set_value(self.param_tf_r, right_wrist)
+            self.opti.set_value(self.var_q_last, self.init_data) # for smooth
 
-            sol_q = self.opti.value(self.var_q)
+            self.opti.solve()
+
+            sol_q = np.asarray(self.opti.value(self.var_q), dtype=float)
+            sol_q = _sanitize_ik_solution(sol_q, current_lr_arm_motor_q, self.reduced_robot.model)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
 
@@ -617,29 +670,13 @@ class G1_23_ArmIK:
                 self.vis.display(sol_q)  # for visualization
 
             return sol_q, sol_tauff
-        
+
         except Exception as e:
-            logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
-
-            sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
-
-            if current_lr_arm_motor_dq is not None:
-                v = current_lr_arm_motor_dq * 0.0
-            else:
-                v = (sol_q - self.init_data) * 0.0
-
-            self.init_data = sol_q
-
-            sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
-
-            logger_mp.error(f"sol_q:{sol_q} \nmotorstate: \n{current_lr_arm_motor_q} \nleft_pose: \n{left_wrist} \nright_pose: \n{right_wrist}")
-            if self.Visualization:
-                self.vis.display(sol_q)  # for visualization
-
-            # return sol_q, sol_tauff
-            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+            # 失败时保持当前实测位置，且不把失败迭代点写进 smooth_filter / init_data。
+            # 原实现用 opti.debug.value() 覆盖两者，下一帧从坏点热启动 -> 可能连续失败。
+            _warn_ik("solve_fail", f"IK failed, holding position: {e}")
+            self.init_data = current_lr_arm_motor_q.copy()
+            return current_lr_arm_motor_q.copy(), np.zeros(self.reduced_robot.model.nv)
 
 
 class H1_2_ArmIK:
@@ -887,24 +924,37 @@ class H1_2_ArmIK:
         return robot_left_pose, robot_right_pose
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
-        if current_lr_arm_motor_q is not None:
-            self.init_data = current_lr_arm_motor_q
-        self.opti.set_initial(self.var_q, self.init_data)
+        # ---- 输入闸门：None / NaN 一律不进入求解器 ----
+        if current_lr_arm_motor_q is None:
+            raise ValueError("[IK] current_lr_arm_motor_q is required (pass measured joint q)")
+        current_lr_arm_motor_q = np.asarray(current_lr_arm_motor_q, dtype=float)
+        left_wrist = np.asarray(left_wrist, dtype=float)
+        right_wrist = np.asarray(right_wrist, dtype=float)
+
+        if not np.all(np.isfinite(current_lr_arm_motor_q)):
+            _warn_ik("q_nan", "measured joint q contains NaN/Inf, refusing to solve")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+        if not (np.all(np.isfinite(left_wrist)) and np.all(np.isfinite(right_wrist))):
+            _warn_ik("pose_nan", "XR wrist pose contains NaN/Inf, holding position")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+
+        self.init_data = current_lr_arm_motor_q
 
         left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization
 
-        self.opti.set_value(self.param_tf_l, left_wrist)
-        self.opti.set_value(self.param_tf_r, right_wrist)
-        self.opti.set_value(self.var_q_last, self.init_data) # for smooth
-
         try:
-            sol = self.opti.solve()
-            # sol = self.opti.solve_limited()
+            self.opti.set_initial(self.var_q, self.init_data)
+            self.opti.set_value(self.param_tf_l, left_wrist)
+            self.opti.set_value(self.param_tf_r, right_wrist)
+            self.opti.set_value(self.var_q_last, self.init_data) # for smooth
 
-            sol_q = self.opti.value(self.var_q)
+            self.opti.solve()
+
+            sol_q = np.asarray(self.opti.value(self.var_q), dtype=float)
+            sol_q = _sanitize_ik_solution(sol_q, current_lr_arm_motor_q, self.reduced_robot.model)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
 
@@ -921,29 +971,14 @@ class H1_2_ArmIK:
                 self.vis.display(sol_q)  # for visualization
 
             return sol_q, sol_tauff
-        
+
         except Exception as e:
-            logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
+            # 失败时保持当前实测位置，且不把失败迭代点写进 smooth_filter / init_data。
+            # 原实现用 opti.debug.value() 覆盖两者，下一帧从坏点热启动 -> 可能连续失败。
+            _warn_ik("solve_fail", f"IK failed, holding position: {e}")
+            self.init_data = current_lr_arm_motor_q.copy()
+            return current_lr_arm_motor_q.copy(), np.zeros(self.reduced_robot.model.nv)
 
-            sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
-
-            if current_lr_arm_motor_dq is not None:
-                v = current_lr_arm_motor_dq * 0.0
-            else:
-                v = (sol_q - self.init_data) * 0.0
-
-            self.init_data = sol_q
-
-            sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
-
-            logger_mp.error(f"sol_q:{sol_q} \nmotorstate: \n{current_lr_arm_motor_q} \nleft_pose: \n{left_wrist} \nright_pose: \n{right_wrist}")
-            if self.Visualization:
-                self.vis.display(sol_q)  # for visualization
-
-            # return sol_q, sol_tauff
-            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
 
 class H1_ArmIK:
     def __init__(self, Unit_Test = False, Visualization = False):
@@ -1194,24 +1229,37 @@ class H1_ArmIK:
         return robot_left_pose, robot_right_pose
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
-        if current_lr_arm_motor_q is not None:
-            self.init_data = current_lr_arm_motor_q
-        self.opti.set_initial(self.var_q, self.init_data)
+        # ---- 输入闸门：None / NaN 一律不进入求解器 ----
+        if current_lr_arm_motor_q is None:
+            raise ValueError("[IK] current_lr_arm_motor_q is required (pass measured joint q)")
+        current_lr_arm_motor_q = np.asarray(current_lr_arm_motor_q, dtype=float)
+        left_wrist = np.asarray(left_wrist, dtype=float)
+        right_wrist = np.asarray(right_wrist, dtype=float)
+
+        if not np.all(np.isfinite(current_lr_arm_motor_q)):
+            _warn_ik("q_nan", "measured joint q contains NaN/Inf, refusing to solve")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+        if not (np.all(np.isfinite(left_wrist)) and np.all(np.isfinite(right_wrist))):
+            _warn_ik("pose_nan", "XR wrist pose contains NaN/Inf, holding position")
+            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+
+        self.init_data = current_lr_arm_motor_q
 
         left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization
 
-        self.opti.set_value(self.param_tf_l, left_wrist)
-        self.opti.set_value(self.param_tf_r, right_wrist)
-        self.opti.set_value(self.var_q_last, self.init_data) # for smooth
-
         try:
-            sol = self.opti.solve()
-            # sol = self.opti.solve_limited()
+            self.opti.set_initial(self.var_q, self.init_data)
+            self.opti.set_value(self.param_tf_l, left_wrist)
+            self.opti.set_value(self.param_tf_r, right_wrist)
+            self.opti.set_value(self.var_q_last, self.init_data) # for smooth
 
-            sol_q = self.opti.value(self.var_q)
+            self.opti.solve()
+
+            sol_q = np.asarray(self.opti.value(self.var_q), dtype=float)
+            sol_q = _sanitize_ik_solution(sol_q, current_lr_arm_motor_q, self.reduced_robot.model)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
 
@@ -1228,30 +1276,13 @@ class H1_ArmIK:
                 self.vis.display(sol_q)  # for visualization
 
             return sol_q, sol_tauff
-        
+
         except Exception as e:
-            logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
-
-            sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
-
-            if current_lr_arm_motor_dq is not None:
-                v = current_lr_arm_motor_dq * 0.0
-            else:
-                v = (sol_q - self.init_data) * 0.0
-
-            self.init_data = sol_q
-
-            sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
-
-            logger_mp.error(f"sol_q:{sol_q} \nmotorstate: \n{current_lr_arm_motor_q} \nleft_pose: \n{left_wrist} \nright_pose: \n{right_wrist}")
-            if self.Visualization:
-                self.vis.display(sol_q)  # for visualization
-
-            # return sol_q, sol_tauff
-            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
-        
+            # 失败时保持当前实测位置，且不把失败迭代点写进 smooth_filter / init_data。
+            # 原实现用 opti.debug.value() 覆盖两者，下一帧从坏点热启动 -> 可能连续失败。
+            _warn_ik("solve_fail", f"IK failed, holding position: {e}")
+            self.init_data = current_lr_arm_motor_q.copy()
+            return current_lr_arm_motor_q.copy(), np.zeros(self.reduced_robot.model.nv)
 if __name__ == "__main__":
     arm_ik = G1_29_ArmIK(Unit_Test = True, Visualization = True)
     # arm_ik = H1_2_ArmIK(Unit_Test = True, Visualization = True)

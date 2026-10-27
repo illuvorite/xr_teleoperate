@@ -28,6 +28,8 @@ import functools
 import subprocess
 import platform
 from .image_client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
+# 机器人状态采集（原独立服务 robot-agent:8013，已合并进本服务 60001）
+from .bms_state import ensure_worker as _ensure_bms_worker, system_status as _bms_system_status
 # webrtc dependencies
 import asyncio
 import json
@@ -628,11 +630,47 @@ class WebRTC_PublisherThread(threading.Thread):
         self._app.router.add_get("/fullscreen", self._fullscreen)
         self._app.router.add_get("/client.js", self._javascript)
         self._app.router.add_post("/offer", self._offer)
+        # 机器人状态（原 8013 的 /status、/health，合并到这里）
+        self._app.router.add_get("/status", self._status)
+        self._app.router.add_get("/health", self._health)
 
         self._app.router.add_options("/", self._options)
         self._app.router.add_options("/fullscreen", self._options)
         self._app.router.add_options("/client.js", self._options)
         self._app.router.add_options("/offer", self._options)
+        self._app.router.add_options("/status", self._options)
+        self._app.router.add_options("/health", self._options)
+
+    async def _status(self, request: web.Request) -> web.Response:
+        """机器人状态：BMS 电量、系统信息、常驻服务状态。
+
+        system_status() 内部会调 subprocess 查 systemctl，同步执行会阻塞事件循环，
+        因此丢到默认线程池里跑。
+
+        必须带 CORS 头：控制台页面跑在另一个 origin（localhost:5174 或公网域名），
+        fetch 这里是跨域请求。iframe 画面不受同源策略限制，但 fetch 会 ——
+        少了 Access-Control-Allow-Origin，浏览器直接拦掉响应，前端表现为
+        "机器人状态不可达"，而不是拿到数据。
+        """
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(None, _bms_system_status)
+        return web.json_response(
+            payload,
+            dumps=functools.partial(json.dumps, ensure_ascii=False),
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    async def _health(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            {"ok": True, "ts": int(time.time() * 1000)},
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
 
     async def _index(self, request: web.Request) -> web.Response:
         return web.Response(content_type="text/html", text=INDEX_HTML)
@@ -744,6 +782,13 @@ class WebRTC_PublisherThread(threading.Thread):
             site = web.TCPSite(self._runner, self._host, self._port, ssl_context=ssl_context)
             await site.start()
             self._start_event.set()
+
+            # 状态采集与 60001 同进程（原 8013 已删除）。ensure_worker 幂等，
+            # 多端口 publisher 也只会初始化一次 DDS。
+            try:
+                _ensure_bms_worker()
+            except Exception as e:
+                logger_mp.error(f"BMS worker start failed: {e}")
             
             # Frame Pushing Loop
             while not self._stop_event.is_set():
@@ -1713,6 +1758,8 @@ class ImageServer:
         self._realsense_enable = realsense_enable
         self._isaacsim_enable = isaacsim_enable
         self._stop_event = threading.Event()
+        # 每路相机的"连续无帧"计数：单帧 None 只告警，连续无帧才判定失效
+        self._no_frame_state: dict[str, dict] = {}
         self._cameras: dict[str, BaseCamera] = {}
         if not self._isaacsim_enable:
             self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
@@ -1924,21 +1971,67 @@ class ImageServer:
 
         logger_mp.info("[Image Server] Image server has started, waiting for client connections...")
 
+    # ------------------------------------------------------------------
+    # 无帧判定
+    #
+    # 原实现只要某路相机在一个周期内读到 None 就 set(_stop_event)，把"单帧抖动"
+    # 升级成"整个进程退出"。相机刚启动首帧未就绪、USB 单次读超时都会命中，
+    # 现场表现就是 systemd 反复重启。这里改为：连续 N 次 或 超过 T 秒才判定失效。
+    # ------------------------------------------------------------------
+    NO_FRAME_MAX_MISSES = int(os.getenv("XR_CAM_NO_FRAME_MAX_MISSES", "90"))
+    NO_FRAME_TIMEOUT_S = float(os.getenv("XR_CAM_NO_FRAME_TIMEOUT_S", "3.0"))
+
+    def _note_no_frame(self, cam_topic: str) -> bool:
+        """记录一次无帧。返回 True 表示该路相机已失效，应停止服务。"""
+        now = time.monotonic()
+        state = self._no_frame_state.get(cam_topic)
+        if state is None:
+            state = {"first": now, "misses": 0}
+            self._no_frame_state[cam_topic] = state
+        state["misses"] += 1
+
+        elapsed = now - state["first"]
+        if state["misses"] < self.NO_FRAME_MAX_MISSES and elapsed < self.NO_FRAME_TIMEOUT_S:
+            # 首次与每 30 次记录一次，避免 30Hz 刷屏
+            if state["misses"] == 1 or state["misses"] % 30 == 0:
+                logger_mp.warning(
+                    f"[Image Server] {cam_topic} returned no frame "
+                    f"(miss {state['misses']}/{self.NO_FRAME_MAX_MISSES}, {elapsed:.1f}s)"
+                )
+            return False
+
+        logger_mp.error(
+            f"[Image Server] {cam_topic} produced no frame for {elapsed:.1f}s "
+            f"({state['misses']} attempts), treating camera as failed"
+        )
+        return True
+
+    def _note_frame_ok(self, cam_topic: str) -> None:
+        self._no_frame_state.pop(cam_topic, None)
+
     def _update_frames(self, cam_topic: str, camera: BaseCamera):
         try:
             interval = 1.0 / camera.get_fps()
             next_frame_time = time.monotonic()
+            consecutive_errors = 0
             while not self._stop_event.is_set():
                 try:
                     camera._update_frame()
+                    consecutive_errors = 0
                 except Exception as e:
+                    consecutive_errors += 1
                     logger_mp.error(
-                        f"[Image Server] Error updating frame for {cam_topic} camera: "
-                        f"{type(e).__name__}: {e}",
-                        exc_info=True,
+                        f"[Image Server] Error updating frame for {cam_topic} camera "
+                        f"(consecutive={consecutive_errors}): {type(e).__name__}: {e}",
+                        exc_info=(consecutive_errors == 1),
                     )
-                    self._stop_event.set()
-                    break
+                    # 单次异常（拔插抖动）不再停机；连续 5 次才认为该路失效
+                    if consecutive_errors >= 5:
+                        logger_mp.error(f"[Image Server] {cam_topic} update failed repeatedly, stopping")
+                        self._stop_event.set()
+                        break
+                    time.sleep(0.1)
+                    continue
                 next_frame_time += interval
                 sleep_time = next_frame_time - time.monotonic()
                 if sleep_time > 0:
@@ -1957,9 +2050,9 @@ class ImageServer:
             while not self._stop_event.is_set():
                 jpeg_bytes = camera.get_jpeg_bytes()
                 if jpeg_bytes is not None:
+                    self._note_frame_ok(cam_topic)
                     self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
-                else:
-                    logger_mp.warning(f"[Image Server] {cam_topic} returned no frame.")
+                elif self._note_no_frame(cam_topic):
                     self._stop_event.set()
                     break
 
@@ -2001,9 +2094,14 @@ class ImageServer:
                     published = True
 
                 if not published:
-                    logger_mp.info(f"[Image Server] {cam_topic} returned no frame.")
-                    self._stop_event.set()
-                    break
+                    if self._note_no_frame(cam_topic):
+                        self._stop_event.set()
+                        break
+                    # 单帧/短时无帧：跳过本次，继续下一周期（不再停整机）
+                    time.sleep(max(0.0, 1.0 / max(camera.get_fps(), 1.0)))
+                    continue
+                else:
+                    self._note_frame_ok(cam_topic)
 
                 next_frame_time += interval
                 sleep_time = next_frame_time - time.monotonic()
@@ -2183,9 +2281,12 @@ def main():
     logger_mp.info("[Image Server] Running... Press Ctrl+C to exit.")
     server.wait()
 
-    # usbhub plugout may cause block process exit, no better solution for now
+    # usbhub plugout may cause block process exit, no better solution for now。
+    # 注意：不能用 os.killpg(os.getpgrp(), 9) —— SIGKILL 会发给整个进程组，
+    # 通过 ros2 launch / bash 脚本启动时会把父脚本和同组节点一起打死，
+    # 且无法捕获、日志不落地。os._exit 只结束当前进程，跳过可能卡住的线程 join。
     time.sleep(0.5)
-    os.killpg(os.getpgrp(), 9)
+    os._exit(0)
 
 if __name__ == "__main__":
     main()

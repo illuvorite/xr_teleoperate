@@ -319,7 +319,7 @@ class ScamCamera:
             time.sleep(0.005)
         logger.warning("[ScamCamera] %s get_bgr_frame: no frame within 0.5s", self._cam_topic)
         return None  # 0.5s 仍无帧：交给 server 的看门狗路径
-    def get_bgr_frame(self): return self._webrtc_buffer.read() if self._webrtc_buffer else None
+
     def get_bgr_frame_left(self): return self._webrtc_buffer_left.read() if self._webrtc_buffer_left else None
     def get_bgr_frame_right(self): return self._webrtc_buffer_right.read() if self._webrtc_buffer_right else None
     def get_zmq_port(self): return self._zmq_port

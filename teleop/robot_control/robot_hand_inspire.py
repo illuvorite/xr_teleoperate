@@ -4,6 +4,7 @@ from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
 import numpy as np
 from enum import IntEnum
+import os
 import threading
 import time
 from multiprocessing import Process, Array
@@ -39,17 +40,27 @@ class Inspire_Controller_DFX:
         self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)  
         self.right_hand_state_array = Array('d', Inspire_Num_Motors, lock=True)
 
+        # DFX 用同一条 MotorStates_ 承载双手，因此只需判断"是否收到首帧"。
+        # 原实现用 any(state_array) 判断，手完全张开（全 0）时会永久卡死。
+        self.hand_sub_ready = threading.Event()
+
         # initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while True:
-            if any(self.right_hand_state_array): # any(self.left_hand_state_array) and 
-                break
-            time.sleep(0.01)
+        timeout_s = float(os.getenv("XR_HAND_READY_TIMEOUT", "10"))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and not self.hand_sub_ready.is_set():
+            time.sleep(0.05)
             logger_mp.warning("[Inspire_Controller_DFX] Waiting to subscribe dds...")
-        logger_mp.info("[Inspire_Controller_DFX] Subscribe dds ok.")
+        if self.hand_sub_ready.is_set():
+            logger_mp.info("[Inspire_Controller_DFX] Subscribe dds ok.")
+        else:
+            logger_mp.error(
+                f"[Inspire_Controller_DFX] hand state timeout after {timeout_s:.1f}s; "
+                "continuing without hand feedback"
+            )
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array))
@@ -66,6 +77,7 @@ class Inspire_Controller_DFX:
                     self.left_hand_state_array[idx] = hand_msg.states[id].q
                 for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
                     self.right_hand_state_array[idx] = hand_msg.states[id].q
+                self.hand_sub_ready.set()
             time.sleep(0.002)
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
@@ -241,6 +253,11 @@ class Inspire_Controller_FTP:
         """
         Send scaled angle commands [0-1000] to both hands.
         """
+        # 必须在本方法内导入：原先写在 __init__ 里的 `import ... as inspire_hand_default`
+        # 只是 __init__ 的局部名，本方法按全局名引用会抛 NameError，导致 inspire_ftp
+        # 一条指令都发不出去（异常被子进程 finally 吞掉，父进程无感知）。
+        import inspire_sdkpy.inspire_hand_defaut as inspire_hand_default
+
         # Left Hand Command
         left_cmd_msg = inspire_hand_default.get_inspire_hand_ctrl()
         left_cmd_msg.angle_set = left_angle_cmd_scaled

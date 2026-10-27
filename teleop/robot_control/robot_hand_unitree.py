@@ -78,16 +78,17 @@ class Dex3_1_Controller:
         self.left_hand_state_array  = Array('d', Dex3_Num_Motors, lock=True)  
         self.right_hand_state_array = Array('d', Dex3_Num_Motors, lock=True)
 
+        # 就绪标志由订阅线程置位。不能用 any(state_array) 判断：Dex3 完全张开
+        # 时关节角可能全为 0，会永久卡在等待循环里。
+        self.left_hand_ready = threading.Event()
+        self.right_hand_ready = threading.Event()
+
         # initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while True:
-            if any(self.left_hand_state_array) and any(self.right_hand_state_array):
-                break
-            time.sleep(0.01)
-            logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
+        self._wait_hand_ready("[Dex3_1_Controller]")
         logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
@@ -97,17 +98,35 @@ class Dex3_1_Controller:
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
 
+    def _wait_hand_ready(self, tag: str) -> None:
+        """等待双手状态首帧；超时后记录错误并继续，避免整个程序永久挂起。"""
+        timeout_s = float(os.getenv("XR_HAND_READY_TIMEOUT", "10"))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.left_hand_ready.is_set() and self.right_hand_ready.is_set():
+                return
+            time.sleep(0.05)
+            logger_mp.warning(f"{tag} Waiting to subscribe dds...")
+        logger_mp.error(
+            f"{tag} hand state timeout after {timeout_s:.1f}s "
+            f"(left={self.left_hand_ready.is_set()}, right={self.right_hand_ready.is_set()}); "
+            "continuing without hand feedback"
+        )
+
     def _subscribe_hand_state(self):
         while True:
             left_hand_msg  = self.LeftHandState_subscriber.Read()
             right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
+            if left_hand_msg is not None:
                 # Update left hand state
                 for idx, id in enumerate(Dex3_1_Left_JointIndex):
                     self.left_hand_state_array[idx] = left_hand_msg.motor_state[id].q
+                self.left_hand_ready.set()
+            if right_hand_msg is not None:
                 # Update right hand state
                 for idx, id in enumerate(Dex3_1_Right_JointIndex):
                     self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
+                self.right_hand_ready.set()
             time.sleep(0.002)
     
     class _RIS_Mode:
@@ -288,10 +307,19 @@ class Dex1_1_Gripper_Controller:
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while not self.gripper_sub_ready:
-            time.sleep(0.01)
+        # 加超时：无发布者时 Read() 可能永久阻塞，不能让初始化无限等待
+        ready_timeout = float(os.getenv("XR_HAND_READY_TIMEOUT", "10"))
+        ready_deadline = time.monotonic() + ready_timeout
+        while not self.gripper_sub_ready and time.monotonic() < ready_deadline:
+            time.sleep(0.05)
             logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting to subscribe dds...")
-        logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
+        if self.gripper_sub_ready:
+            logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
+        else:
+            logger_mp.error(
+                f"[Dex1_1_Gripper_Controller] gripper state timeout after {ready_timeout:.1f}s; "
+                "continuing without feedback"
+            )
 
         self.gripper_control_thread = threading.Thread(target=self.control_thread, args=(left_gripper_value_in, right_gripper_value_in, self.left_gripper_state_value, self.right_gripper_state_value,
                                                                                          dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out))

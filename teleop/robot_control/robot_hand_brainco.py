@@ -5,6 +5,7 @@ from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
 import numpy as np
 from enum import IntEnum
+import os
 import threading
 import time
 from multiprocessing import Process, Array
@@ -53,10 +54,19 @@ class Brainco_Controller:
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while not self.hand_sub_ready:
+        # 加超时：无发布者时 Read() 可能永久阻塞，不能让初始化无限等待
+        ready_timeout = float(os.getenv("XR_HAND_READY_TIMEOUT", "10"))
+        ready_deadline = time.monotonic() + ready_timeout
+        while not self.hand_sub_ready and time.monotonic() < ready_deadline:
             time.sleep(0.1)
             logger_mp.warning("[brainco_Controller] Waiting to subscribe dds...")
-        logger_mp.info("[brainco_Controller] Subscribe dds ok.")
+        if self.hand_sub_ready:
+            logger_mp.info("[brainco_Controller] Subscribe dds ok.")
+        else:
+            logger_mp.error(
+                f"[brainco_Controller] hand state timeout after {ready_timeout:.1f}s; "
+                "continuing without feedback"
+            )
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array))

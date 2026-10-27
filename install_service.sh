@@ -263,6 +263,10 @@ ExecStartPre=+/bin/bash ${payload}/install_service.sh tune-usb
 ExecStart=${payload}/scripts/start_teleimager.sh
 Restart=on-failure
 RestartSec=5
+# teleimager-server 不处理 SIGTERM：systemd 默认 TimeoutStopSec=90s，停止期间服务
+# 会卡在 deactivating，部署器这时点「启动」直接报「服务当前状态: 0 / deactivating」。
+# 缩到 8s：留一点清理时间，又不让停止流程长时间挂住（超时后 systemd 自己 SIGKILL）。
+TimeoutStopSec=8s
 StandardOutput=append:${LOG_DIR}/xr-teleimager.log
 StandardError=append:${LOG_DIR}/xr-teleimager.log
 

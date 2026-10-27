@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import threading
 import time
@@ -22,6 +23,38 @@ G1_29_Num_Motors = 35
 G1_23_Num_Motors = 35
 H1_2_Num_Motors = 35
 H1_Num_Motors = 20
+
+# ---------------------------------------------------------------------------
+# 关节运动安全上限
+#
+# 原实现把 20 -> 30 rad/s 当作"限速"，但 G1 臂展约 0.7 m，20 rad/s 换算到
+# 末端接近 14 m/s，30 rad/s 接近 21 m/s —— 这已经不能提供任何保护，反而会在
+# XR 抖动或 IK 跳变时把机械臂甩出去。这里按"人臂快速摆动"的量级收窄到
+# 1.5 -> 3.0 rad/s，并增加加速度上限，避免速度指令阶跃。
+#
+# 允许用环境变量覆盖，方便现场按机型/任务微调而不改代码：
+#   XR_ARM_VELOCITY_LIMIT_START / XR_ARM_VELOCITY_LIMIT_MAX / XR_ARM_ACCEL_LIMIT
+# ---------------------------------------------------------------------------
+ARM_VELOCITY_LIMIT_START = float(os.getenv("XR_ARM_VELOCITY_LIMIT_START", "1.5"))
+ARM_VELOCITY_LIMIT_MAX = float(os.getenv("XR_ARM_VELOCITY_LIMIT_MAX", "3.0"))
+ARM_VELOCITY_LIMIT_SIM = float(os.getenv("XR_ARM_VELOCITY_LIMIT_SIM", "30.0"))
+ARM_ACCEL_LIMIT = float(os.getenv("XR_ARM_ACCEL_LIMIT", "10.0"))
+# lowstate 超过该时长没有更新，就认为 DDS 状态已陈旧
+ARM_LOWSTATE_TIMEOUT = float(os.getenv("XR_ARM_LOWSTATE_TIMEOUT", "0.5"))
+
+_warn_ts = {}
+_warn_lock = threading.Lock()
+
+
+def _warn_throttled(key: str, msg: str, period: float = 1.0) -> None:
+    """限流打错误日志，避免 250Hz 控制回路把日志刷爆（进而拖慢控制回路）。"""
+    now = time.monotonic()
+    with _warn_lock:
+        if now - _warn_ts.get(key, 0.0) < period:
+            return
+        _warn_ts[key] = now
+    logger_mp.error(f"[arm-safety] {msg}")
+
  
 
 class MotorState:
@@ -48,6 +81,7 @@ class H1_LowState:
 class DataBuffer:
     def __init__(self):
         self.data = None
+        self.ts = 0.0
         self.lock = threading.Lock()
 
     def GetData(self):
@@ -57,6 +91,12 @@ class DataBuffer:
     def SetData(self, data):
         with self.lock:
             self.data = data
+            self.ts = time.monotonic()
+
+    def IsFresh(self, timeout: float = ARM_LOWSTATE_TIMEOUT) -> bool:
+        """lowstate 是否在 timeout 内更新过。用于发现 DDS 断连后的陈旧状态。"""
+        with self.lock:
+            return self.data is not None and (time.monotonic() - self.ts) < timeout
 
 class G1_29_ArmController:
     def __init__(self, motion_mode = False, simulation_mode = False):
@@ -73,8 +113,15 @@ class G1_29_ArmController:
         self.kd_wrist = 1.5
 
         self.all_motor_q = None
-        self.arm_velocity_limit = 20.0
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START
         self.control_dt = 1.0 / 250.0
+        self.arm_accel_limit = ARM_ACCEL_LIMIT
+        # 上一周期的实际步长，用于加速度限幅；None 表示首周期不限制
+        self._last_delta = None
+        # 实测控制周期的指数滑动平均，替代理想值 control_dt
+        self._dt_ema = self.control_dt
+        # 退出时由 go_home 置位，发布线程负责把 arm_sdk 权重平滑降到 0
+        self._release_motion_weight = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -106,6 +153,13 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        # 关键：用实测关节角初始化目标值。
+        # 原实现 q_target = zeros，而发布线程在 __init__ 末尾就启动，结果进程一
+        # 启动、用户还没按 [r]，机械臂就会被 250Hz 地拉向全零位（可能穿过躯干）。
+        # 此刻 lowstate 已在上面阻塞等待过，数据一定可用；发布线程尚未启动，
+        # 因此这里不需要加锁。
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target)
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -149,50 +203,119 @@ class G1_29_ArmController:
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
-    def clip_arm_q_target(self, target_q, velocity_limit):
+    def clip_arm_q_target(self, target_q, velocity_limit=None, dt=None):
+        '''把目标关节角限制在"单周期最大步长"与"加速度上限"之内。
+
+        这是下发前的最后一道数值闸门：
+          * 形状不匹配 / NaN / Inf  -> 保持当前实测位置，绝不把坏值送进 DDS；
+          * 速度限幅按比例缩放（保持各关节联动方向不变）；
+          * 加速度限幅逐关节进行，避免速度指令阶跃。
+        '''
+        if velocity_limit is None:
+            velocity_limit = self.arm_velocity_limit
+        if dt is None:
+            dt = self._dt_ema
+
         current_q = self.get_current_dual_arm_q()
+        target_q = np.asarray(target_q, dtype=float)
+
+        if target_q.shape != current_q.shape:
+            _warn_throttled(
+                "clip_shape",
+                f"target shape {target_q.shape} != current {current_q.shape}, holding position",
+            )
+            return current_q
+        if not np.all(np.isfinite(target_q)) or not np.all(np.isfinite(current_q)):
+            _warn_throttled("clip_nan", "non-finite joint target rejected, holding position")
+            return current_q
+
         delta = target_q - current_q
-        motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
-        cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
-        return cliped_arm_q_target
+        max_step = max(velocity_limit * dt, 1e-6)
+        peak = float(np.max(np.abs(delta)))
+        if peak > max_step:
+            delta = delta * (max_step / peak)
+
+        if self._last_delta is not None and self._last_delta.shape == delta.shape:
+            max_dv = max(self.arm_accel_limit * dt, 1e-6)
+            delta = np.clip(delta, self._last_delta - max_dv, self._last_delta + max_dv)
+
+        self._last_delta = delta
+        return current_q + delta
 
     def _ctrl_motor_state(self):
         if self.motion_mode:
-            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0;
+            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0
 
+        last_tick = time.monotonic()
         while True:
-            start_time = time.time()
+            try:
+                start_time = time.monotonic()
+                dt = max(start_time - last_tick, 1e-4)
+                last_tick = start_time
+                # 用实测周期做 EMA：调度抖动时仍按真实时间计算限速
+                self._dt_ema = 0.9 * self._dt_ema + 0.1 * dt
 
-            with self.ctrl_lock:
-                arm_q_target     = self.q_target
-                arm_tauff_target = self.tauff_target
+                if not self.lowstate_buffer.IsFresh():
+                    # DDS 状态陈旧 -> limiter 用的 current_q 不可信，冻结目标并告警
+                    _warn_throttled("lowstate_stale", "lowstate stale, holding last valid command")
 
-            if self.simulation_mode:
-                cliped_arm_q_target = arm_q_target
-            else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                with self.ctrl_lock:
+                    arm_q_target     = self.q_target
+                    arm_tauff_target = self.tauff_target
 
-            for idx, id in enumerate(G1_29_JointArmIndex):
-                self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
-                self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+                if self.simulation_mode:
+                    cliped_arm_q_target = arm_q_target
+                else:
+                    cliped_arm_q_target = self.clip_arm_q_target(
+                        arm_q_target, velocity_limit=self.arm_velocity_limit, dt=self._dt_ema
+                    )
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+                if (not np.all(np.isfinite(cliped_arm_q_target))
+                        or not np.all(np.isfinite(arm_tauff_target))):
+                    _warn_throttled("loop_nan", "non-finite command dropped in publish loop")
+                else:
+                    if self.motion_mode and self._release_motion_weight:
+                        weight = self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q
+                        self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = max(0.0, weight - dt / 2.0)
 
-            if self._speed_gradual_max is True:
-                t_elapsed = start_time - self._gradual_start_time
-                self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
+                    for idx, id in enumerate(G1_29_JointArmIndex):
+                        self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
+                        self.msg.motor_cmd[id].dq = 0
+                        self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
-            current_time = time.time()
-            all_t_elapsed = current_time - start_time
-            sleep_time = max(0, (self.control_dt - all_t_elapsed))
-            time.sleep(sleep_time)
-            # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
-            # logger_mp.debug(f"sleep_time:{sleep_time}")
+                    self.msg.crc = self.crc.Crc(self.msg)
+                    self.lowcmd_publisher.Write(self.msg)
+
+                if self._speed_gradual_max is True:
+                    t_elapsed = start_time - self._gradual_start_time
+                    ratio = min(1.0, t_elapsed / self._gradual_time) if self._gradual_time else 1.0
+                    self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START + (
+                        (ARM_VELOCITY_LIMIT_MAX - ARM_VELOCITY_LIMIT_START) * ratio
+                    )
+
+                all_t_elapsed = time.monotonic() - start_time
+                time.sleep(max(0.0, self.control_dt - all_t_elapsed))
+            except Exception:
+                logger_mp.exception("[arm] publish loop error, continuing")
+                time.sleep(0.01)
 
     def ctrl_dual_arm(self, q_target, tauff_target):
-        '''Set control target values q & tau of the left and right arm motors.'''
+        '''Set control target values q & tau of the left and right arm motors.
+
+        非有限值（NaN/Inf）或形状不符的输入在这里被拦下并保留上一帧有效目标。
+        上游 XR 追踪丢失时可能产生 NaN，若不拦会一路传到 CRC 与 DDS。
+        '''
+        q_target = np.asarray(q_target, dtype=float)
+        tauff_target = np.asarray(tauff_target, dtype=float)
+        if q_target.shape != self.q_target.shape or tauff_target.shape != self.tauff_target.shape:
+            _warn_throttled(
+                "cmd_shape",
+                f"ctrl_dual_arm shape mismatch: q{q_target.shape} tau{tauff_target.shape}",
+            )
+            return
+        if not np.all(np.isfinite(q_target)) or not np.all(np.isfinite(tauff_target)):
+            _warn_throttled("cmd_nan", "ctrl_dual_arm rejected non-finite target, keeping previous")
+            return
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
@@ -214,35 +337,39 @@ class G1_29_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
-        '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
-        logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
-        max_attempts = 100
-        current_attempts = 0
+        '''退出时保持当前位姿，并平滑卸载 arm_sdk 权重。
+
+        不再把目标置为全零位，原因：
+          * 从任意姿态直线插补到零位会穿过躯干/自碰撞区，且没有碰撞检查；
+          * 旧的重力前馈会叠加在零位上，形成力矩偏置；
+          * 主线程直接写 self.msg 会与发布线程的 CRC 计算竞争。
+        现在只做"停在原地 + 由发布线程逐步卸力"，并且超时也会返回，不阻塞退出。
+        '''
+        logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home: hold current pose and release motion weight...")
         with self.ctrl_lock:
-            self.q_target = np.zeros(14)
-            # self.tauff_target = np.zeros(14)
-        tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
-        while current_attempts < max_attempts:
-            current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight;
-                        time.sleep(0.02)
-                logger_mp.info("[G1_29_ArmController] both arms have reached the home position.")
+            self.q_target = self.get_current_dual_arm_q().copy()
+        if not self.motion_mode:
+            logger_mp.info("[G1_29_ArmController] debug mode: holding current pose.")
+            return
+        self._release_motion_weight = True
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q <= 0.01:
                 break
-            current_attempts += 1
             time.sleep(0.05)
+        logger_mp.info("[G1_29_ArmController] motion weight released, arms hold pose.")
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
-        self._gradual_start_time = time.time()
+        # 必须与发布循环里的 time.monotonic() 同源，否则会算出巨大的 elapsed
+        self._gradual_start_time = time.monotonic()
         self._gradual_time = t
         self._speed_gradual_max = True
 
     def speed_instant_max(self):
         '''set arms velocity to the maximum value immediately, instead of gradually increasing.'''
-        self.arm_velocity_limit = 30.0
+        # 仿真没有物理约束，保留原量级；真机则用收紧后的上限
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_SIM if self.simulation_mode else ARM_VELOCITY_LIMIT_MAX
 
     def _Is_weak_motor(self, motor_index):
         weak_motors = [
@@ -355,8 +482,15 @@ class G1_23_ArmController:
         self.kd_wrist = 1.5
 
         self.all_motor_q = None
-        self.arm_velocity_limit = 20.0
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START
         self.control_dt = 1.0 / 250.0
+        self.arm_accel_limit = ARM_ACCEL_LIMIT
+        # 上一周期的实际步长，用于加速度限幅；None 表示首周期不限制
+        self._last_delta = None
+        # 实测控制周期的指数滑动平均，替代理想值 control_dt
+        self._dt_ema = self.control_dt
+        # 退出时由 go_home 置位，发布线程负责把 arm_sdk 权重平滑降到 0
+        self._release_motion_weight = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -389,6 +523,13 @@ class G1_23_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        # 关键：用实测关节角初始化目标值。
+        # 原实现 q_target = zeros，而发布线程在 __init__ 末尾就启动，结果进程一
+        # 启动、用户还没按 [r]，机械臂就会被 250Hz 地拉向全零位（可能穿过躯干）。
+        # 此刻 lowstate 已在上面阻塞等待过，数据一定可用；发布线程尚未启动，
+        # 因此这里不需要加锁。
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target)
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -432,50 +573,119 @@ class G1_23_ArmController:
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
-    def clip_arm_q_target(self, target_q, velocity_limit):
+    def clip_arm_q_target(self, target_q, velocity_limit=None, dt=None):
+        '''把目标关节角限制在"单周期最大步长"与"加速度上限"之内。
+
+        这是下发前的最后一道数值闸门：
+          * 形状不匹配 / NaN / Inf  -> 保持当前实测位置，绝不把坏值送进 DDS；
+          * 速度限幅按比例缩放（保持各关节联动方向不变）；
+          * 加速度限幅逐关节进行，避免速度指令阶跃。
+        '''
+        if velocity_limit is None:
+            velocity_limit = self.arm_velocity_limit
+        if dt is None:
+            dt = self._dt_ema
+
         current_q = self.get_current_dual_arm_q()
+        target_q = np.asarray(target_q, dtype=float)
+
+        if target_q.shape != current_q.shape:
+            _warn_throttled(
+                "clip_shape",
+                f"target shape {target_q.shape} != current {current_q.shape}, holding position",
+            )
+            return current_q
+        if not np.all(np.isfinite(target_q)) or not np.all(np.isfinite(current_q)):
+            _warn_throttled("clip_nan", "non-finite joint target rejected, holding position")
+            return current_q
+
         delta = target_q - current_q
-        motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
-        cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
-        return cliped_arm_q_target
+        max_step = max(velocity_limit * dt, 1e-6)
+        peak = float(np.max(np.abs(delta)))
+        if peak > max_step:
+            delta = delta * (max_step / peak)
+
+        if self._last_delta is not None and self._last_delta.shape == delta.shape:
+            max_dv = max(self.arm_accel_limit * dt, 1e-6)
+            delta = np.clip(delta, self._last_delta - max_dv, self._last_delta + max_dv)
+
+        self._last_delta = delta
+        return current_q + delta
 
     def _ctrl_motor_state(self):
         if self.motion_mode:
-            self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = 1.0;
+            self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = 1.0
 
+        last_tick = time.monotonic()
         while True:
-            start_time = time.time()
+            try:
+                start_time = time.monotonic()
+                dt = max(start_time - last_tick, 1e-4)
+                last_tick = start_time
+                # 用实测周期做 EMA：调度抖动时仍按真实时间计算限速
+                self._dt_ema = 0.9 * self._dt_ema + 0.1 * dt
 
-            with self.ctrl_lock:
-                arm_q_target     = self.q_target
-                arm_tauff_target = self.tauff_target
+                if not self.lowstate_buffer.IsFresh():
+                    # DDS 状态陈旧 -> limiter 用的 current_q 不可信，冻结目标并告警
+                    _warn_throttled("lowstate_stale", "lowstate stale, holding last valid command")
 
-            if self.simulation_mode:
-                cliped_arm_q_target = arm_q_target
-            else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                with self.ctrl_lock:
+                    arm_q_target     = self.q_target
+                    arm_tauff_target = self.tauff_target
 
-            for idx, id in enumerate(G1_23_JointArmIndex):
-                self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
-                self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
+                if self.simulation_mode:
+                    cliped_arm_q_target = arm_q_target
+                else:
+                    cliped_arm_q_target = self.clip_arm_q_target(
+                        arm_q_target, velocity_limit=self.arm_velocity_limit, dt=self._dt_ema
+                    )
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+                if (not np.all(np.isfinite(cliped_arm_q_target))
+                        or not np.all(np.isfinite(arm_tauff_target))):
+                    _warn_throttled("loop_nan", "non-finite command dropped in publish loop")
+                else:
+                    if self.motion_mode and self._release_motion_weight:
+                        weight = self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q
+                        self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = max(0.0, weight - dt / 2.0)
 
-            if self._speed_gradual_max is True:
-                t_elapsed = start_time - self._gradual_start_time
-                self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
+                    for idx, id in enumerate(G1_23_JointArmIndex):
+                        self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
+                        self.msg.motor_cmd[id].dq = 0
+                        self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
-            current_time = time.time()
-            all_t_elapsed = current_time - start_time
-            sleep_time = max(0, (self.control_dt - all_t_elapsed))
-            time.sleep(sleep_time)
-            # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
-            # logger_mp.debug(f"sleep_time:{sleep_time}")
+                    self.msg.crc = self.crc.Crc(self.msg)
+                    self.lowcmd_publisher.Write(self.msg)
+
+                if self._speed_gradual_max is True:
+                    t_elapsed = start_time - self._gradual_start_time
+                    ratio = min(1.0, t_elapsed / self._gradual_time) if self._gradual_time else 1.0
+                    self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START + (
+                        (ARM_VELOCITY_LIMIT_MAX - ARM_VELOCITY_LIMIT_START) * ratio
+                    )
+
+                all_t_elapsed = time.monotonic() - start_time
+                time.sleep(max(0.0, self.control_dt - all_t_elapsed))
+            except Exception:
+                logger_mp.exception("[arm] publish loop error, continuing")
+                time.sleep(0.01)
 
     def ctrl_dual_arm(self, q_target, tauff_target):
-        '''Set control target values q & tau of the left and right arm motors.'''
+        '''Set control target values q & tau of the left and right arm motors.
+
+        非有限值（NaN/Inf）或形状不符的输入在这里被拦下并保留上一帧有效目标。
+        上游 XR 追踪丢失时可能产生 NaN，若不拦会一路传到 CRC 与 DDS。
+        '''
+        q_target = np.asarray(q_target, dtype=float)
+        tauff_target = np.asarray(tauff_target, dtype=float)
+        if q_target.shape != self.q_target.shape or tauff_target.shape != self.tauff_target.shape:
+            _warn_throttled(
+                "cmd_shape",
+                f"ctrl_dual_arm shape mismatch: q{q_target.shape} tau{tauff_target.shape}",
+            )
+            return
+        if not np.all(np.isfinite(q_target)) or not np.all(np.isfinite(tauff_target)):
+            _warn_throttled("cmd_nan", "ctrl_dual_arm rejected non-finite target, keeping previous")
+            return
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
@@ -498,34 +708,31 @@ class G1_23_ArmController:
     
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
-        logger_mp.info("[G1_23_ArmController] ctrl_dual_arm_go_home start...")
-        max_attempts = 100
-        current_attempts = 0
+        logger_mp.info("[G1_23_ArmController] ctrl_dual_arm_go_home: hold current pose and release motion weight...")
         with self.ctrl_lock:
-            self.q_target = np.zeros(10)
-            # self.tauff_target = np.zeros(10)
-        tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
-        while current_attempts < max_attempts:
-            current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = weight;
-                        time.sleep(0.02)
-                logger_mp.info("[G1_23_ArmController] both arms have reached the home position.")
+            self.q_target = self.get_current_dual_arm_q().copy()
+        if not self.motion_mode:
+            logger_mp.info("[G1_23_ArmController] debug mode: holding current pose.")
+            return
+        self._release_motion_weight = True
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q <= 0.01:
                 break
-            current_attempts += 1
             time.sleep(0.05)
+        logger_mp.info("[G1_23_ArmController] motion weight released, arms hold pose.")
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
-        self._gradual_start_time = time.time()
+        # 必须与发布循环里的 time.monotonic() 同源，否则会算出巨大的 elapsed
+        self._gradual_start_time = time.monotonic()
         self._gradual_time = t
         self._speed_gradual_max = True
 
     def speed_instant_max(self):
         '''set arms velocity to the maximum value immediately, instead of gradually increasing.'''
-        self.arm_velocity_limit = 30.0
+        # 仿真没有物理约束，保留原量级；真机则用收紧后的上限
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_SIM if self.simulation_mode else ARM_VELOCITY_LIMIT_MAX
 
     def _Is_weak_motor(self, motor_index):
         weak_motors = [
@@ -630,8 +837,15 @@ class H1_2_ArmController:
         self.kd_wrist = 2.0
 
         self.all_motor_q = None
-        self.arm_velocity_limit = 20.0
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START
         self.control_dt = 1.0 / 250.0
+        self.arm_accel_limit = ARM_ACCEL_LIMIT
+        # 上一周期的实际步长，用于加速度限幅；None 表示首周期不限制
+        self._last_delta = None
+        # 实测控制周期的指数滑动平均，替代理想值 control_dt
+        self._dt_ema = self.control_dt
+        # 退出时由 go_home 置位，发布线程负责把 arm_sdk 权重平滑降到 0
+        self._release_motion_weight = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -664,6 +878,13 @@ class H1_2_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        # 关键：用实测关节角初始化目标值。
+        # 原实现 q_target = zeros，而发布线程在 __init__ 末尾就启动，结果进程一
+        # 启动、用户还没按 [r]，机械臂就会被 250Hz 地拉向全零位（可能穿过躯干）。
+        # 此刻 lowstate 已在上面阻塞等待过，数据一定可用；发布线程尚未启动，
+        # 因此这里不需要加锁。
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target)
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -707,50 +928,119 @@ class H1_2_ArmController:
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
-    def clip_arm_q_target(self, target_q, velocity_limit):
+    def clip_arm_q_target(self, target_q, velocity_limit=None, dt=None):
+        '''把目标关节角限制在"单周期最大步长"与"加速度上限"之内。
+
+        这是下发前的最后一道数值闸门：
+          * 形状不匹配 / NaN / Inf  -> 保持当前实测位置，绝不把坏值送进 DDS；
+          * 速度限幅按比例缩放（保持各关节联动方向不变）；
+          * 加速度限幅逐关节进行，避免速度指令阶跃。
+        '''
+        if velocity_limit is None:
+            velocity_limit = self.arm_velocity_limit
+        if dt is None:
+            dt = self._dt_ema
+
         current_q = self.get_current_dual_arm_q()
+        target_q = np.asarray(target_q, dtype=float)
+
+        if target_q.shape != current_q.shape:
+            _warn_throttled(
+                "clip_shape",
+                f"target shape {target_q.shape} != current {current_q.shape}, holding position",
+            )
+            return current_q
+        if not np.all(np.isfinite(target_q)) or not np.all(np.isfinite(current_q)):
+            _warn_throttled("clip_nan", "non-finite joint target rejected, holding position")
+            return current_q
+
         delta = target_q - current_q
-        motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
-        cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
-        return cliped_arm_q_target
+        max_step = max(velocity_limit * dt, 1e-6)
+        peak = float(np.max(np.abs(delta)))
+        if peak > max_step:
+            delta = delta * (max_step / peak)
+
+        if self._last_delta is not None and self._last_delta.shape == delta.shape:
+            max_dv = max(self.arm_accel_limit * dt, 1e-6)
+            delta = np.clip(delta, self._last_delta - max_dv, self._last_delta + max_dv)
+
+        self._last_delta = delta
+        return current_q + delta
 
     def _ctrl_motor_state(self):
         if self.motion_mode:
-            self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = 1.0;
+            self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = 1.0
 
+        last_tick = time.monotonic()
         while True:
-            start_time = time.time()
+            try:
+                start_time = time.monotonic()
+                dt = max(start_time - last_tick, 1e-4)
+                last_tick = start_time
+                # 用实测周期做 EMA：调度抖动时仍按真实时间计算限速
+                self._dt_ema = 0.9 * self._dt_ema + 0.1 * dt
 
-            with self.ctrl_lock:
-                arm_q_target     = self.q_target
-                arm_tauff_target = self.tauff_target
+                if not self.lowstate_buffer.IsFresh():
+                    # DDS 状态陈旧 -> limiter 用的 current_q 不可信，冻结目标并告警
+                    _warn_throttled("lowstate_stale", "lowstate stale, holding last valid command")
 
-            if self.simulation_mode:
-                cliped_arm_q_target = arm_q_target
-            else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                with self.ctrl_lock:
+                    arm_q_target     = self.q_target
+                    arm_tauff_target = self.tauff_target
 
-            for idx, id in enumerate(H1_2_JointArmIndex):
-                self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
-                self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
+                if self.simulation_mode:
+                    cliped_arm_q_target = arm_q_target
+                else:
+                    cliped_arm_q_target = self.clip_arm_q_target(
+                        arm_q_target, velocity_limit=self.arm_velocity_limit, dt=self._dt_ema
+                    )
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+                if (not np.all(np.isfinite(cliped_arm_q_target))
+                        or not np.all(np.isfinite(arm_tauff_target))):
+                    _warn_throttled("loop_nan", "non-finite command dropped in publish loop")
+                else:
+                    if self.motion_mode and self._release_motion_weight:
+                        weight = self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q
+                        self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = max(0.0, weight - dt / 2.0)
 
-            if self._speed_gradual_max is True:
-                t_elapsed = start_time - self._gradual_start_time
-                self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
+                    for idx, id in enumerate(H1_2_JointArmIndex):
+                        self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
+                        self.msg.motor_cmd[id].dq = 0
+                        self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
-            current_time = time.time()
-            all_t_elapsed = current_time - start_time
-            sleep_time = max(0, (self.control_dt - all_t_elapsed))
-            time.sleep(sleep_time)
-            # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
-            # logger_mp.debug(f"sleep_time:{sleep_time}")
+                    self.msg.crc = self.crc.Crc(self.msg)
+                    self.lowcmd_publisher.Write(self.msg)
+
+                if self._speed_gradual_max is True:
+                    t_elapsed = start_time - self._gradual_start_time
+                    ratio = min(1.0, t_elapsed / self._gradual_time) if self._gradual_time else 1.0
+                    self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START + (
+                        (ARM_VELOCITY_LIMIT_MAX - ARM_VELOCITY_LIMIT_START) * ratio
+                    )
+
+                all_t_elapsed = time.monotonic() - start_time
+                time.sleep(max(0.0, self.control_dt - all_t_elapsed))
+            except Exception:
+                logger_mp.exception("[arm] publish loop error, continuing")
+                time.sleep(0.01)
 
     def ctrl_dual_arm(self, q_target, tauff_target):
-        '''Set control target values q & tau of the left and right arm motors.'''
+        '''Set control target values q & tau of the left and right arm motors.
+
+        非有限值（NaN/Inf）或形状不符的输入在这里被拦下并保留上一帧有效目标。
+        上游 XR 追踪丢失时可能产生 NaN，若不拦会一路传到 CRC 与 DDS。
+        '''
+        q_target = np.asarray(q_target, dtype=float)
+        tauff_target = np.asarray(tauff_target, dtype=float)
+        if q_target.shape != self.q_target.shape or tauff_target.shape != self.tauff_target.shape:
+            _warn_throttled(
+                "cmd_shape",
+                f"ctrl_dual_arm shape mismatch: q{q_target.shape} tau{tauff_target.shape}",
+            )
+            return
+        if not np.all(np.isfinite(q_target)) or not np.all(np.isfinite(tauff_target)):
+            _warn_throttled("cmd_nan", "ctrl_dual_arm rejected non-finite target, keeping previous")
+            return
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
@@ -773,34 +1063,31 @@ class H1_2_ArmController:
     
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
-        logger_mp.info("[H1_2_ArmController] ctrl_dual_arm_go_home start...")
-        max_attempts = 100
-        current_attempts = 0
+        logger_mp.info("[H1_2_ArmController] ctrl_dual_arm_go_home: hold current pose and release motion weight...")
         with self.ctrl_lock:
-            self.q_target = np.zeros(14)
-            # self.tauff_target = np.zeros(14)
-        tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
-        while current_attempts < max_attempts:
-            current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = weight;
-                        time.sleep(0.02)
-                logger_mp.info("[H1_2_ArmController] both arms have reached the home position.")
+            self.q_target = self.get_current_dual_arm_q().copy()
+        if not self.motion_mode:
+            logger_mp.info("[H1_2_ArmController] debug mode: holding current pose.")
+            return
+        self._release_motion_weight = True
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q <= 0.01:
                 break
-            current_attempts += 1
             time.sleep(0.05)
+        logger_mp.info("[H1_2_ArmController] motion weight released, arms hold pose.")
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
-        self._gradual_start_time = time.time()
+        # 必须与发布循环里的 time.monotonic() 同源，否则会算出巨大的 elapsed
+        self._gradual_start_time = time.monotonic()
         self._gradual_time = t
         self._speed_gradual_max = True
 
     def speed_instant_max(self):
         '''set arms velocity to the maximum value immediately, instead of gradually increasing.'''
-        self.arm_velocity_limit = 30.0
+        # 仿真没有物理约束，保留原量级；真机则用收紧后的上限
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_SIM if self.simulation_mode else ARM_VELOCITY_LIMIT_MAX
 
     def _Is_weak_motor(self, motor_index):
         weak_motors = [
@@ -909,8 +1196,15 @@ class H1_ArmController:
         self.kd_low = 3.0
 
         self.all_motor_q = None
-        self.arm_velocity_limit = 20.0
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START
         self.control_dt = 1.0 / 250.0
+        self.arm_accel_limit = ARM_ACCEL_LIMIT
+        # 上一周期的实际步长，用于加速度限幅；None 表示首周期不限制
+        self._last_delta = None
+        # 实测控制周期的指数滑动平均，替代理想值 control_dt
+        self._dt_ema = self.control_dt
+        # 退出时由 go_home 置位，发布线程负责把 arm_sdk 权重平滑降到 0
+        self._release_motion_weight = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -941,6 +1235,13 @@ class H1_ArmController:
         self.msg.gpio = 0
 
         self.all_motor_q = self.get_current_motor_q()
+        # 关键：用实测关节角初始化目标值。
+        # 原实现 q_target = zeros，而发布线程在 __init__ 末尾就启动，结果进程一
+        # 启动、用户还没按 [r]，机械臂就会被 250Hz 地拉向全零位（可能穿过躯干）。
+        # 此刻 lowstate 已在上面阻塞等待过，数据一定可用；发布线程尚未启动，
+        # 因此这里不需要加锁。
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target)
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -976,47 +1277,112 @@ class H1_ArmController:
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
-    def clip_arm_q_target(self, target_q, velocity_limit):
+    def clip_arm_q_target(self, target_q, velocity_limit=None, dt=None):
+        '''把目标关节角限制在"单周期最大步长"与"加速度上限"之内。
+
+        这是下发前的最后一道数值闸门：
+          * 形状不匹配 / NaN / Inf  -> 保持当前实测位置，绝不把坏值送进 DDS；
+          * 速度限幅按比例缩放（保持各关节联动方向不变）；
+          * 加速度限幅逐关节进行，避免速度指令阶跃。
+        '''
+        if velocity_limit is None:
+            velocity_limit = self.arm_velocity_limit
+        if dt is None:
+            dt = self._dt_ema
+
         current_q = self.get_current_dual_arm_q()
+        target_q = np.asarray(target_q, dtype=float)
+
+        if target_q.shape != current_q.shape:
+            _warn_throttled(
+                "clip_shape",
+                f"target shape {target_q.shape} != current {current_q.shape}, holding position",
+            )
+            return current_q
+        if not np.all(np.isfinite(target_q)) or not np.all(np.isfinite(current_q)):
+            _warn_throttled("clip_nan", "non-finite joint target rejected, holding position")
+            return current_q
+
         delta = target_q - current_q
-        motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
-        cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
-        return cliped_arm_q_target
+        max_step = max(velocity_limit * dt, 1e-6)
+        peak = float(np.max(np.abs(delta)))
+        if peak > max_step:
+            delta = delta * (max_step / peak)
+
+        if self._last_delta is not None and self._last_delta.shape == delta.shape:
+            max_dv = max(self.arm_accel_limit * dt, 1e-6)
+            delta = np.clip(delta, self._last_delta - max_dv, self._last_delta + max_dv)
+
+        self._last_delta = delta
+        return current_q + delta
 
     def _ctrl_motor_state(self):
+        last_tick = time.monotonic()
         while True:
-            start_time = time.time()
+            try:
+                start_time = time.monotonic()
+                dt = max(start_time - last_tick, 1e-4)
+                last_tick = start_time
+                # 用实测周期做 EMA：调度抖动时仍按真实时间计算限速
+                self._dt_ema = 0.9 * self._dt_ema + 0.1 * dt
 
-            with self.ctrl_lock:
-                arm_q_target     = self.q_target
-                arm_tauff_target = self.tauff_target
+                if not self.lowstate_buffer.IsFresh():
+                    # DDS 状态陈旧 -> limiter 用的 current_q 不可信，冻结目标并告警
+                    _warn_throttled("lowstate_stale", "lowstate stale, holding last valid command")
 
-            if self.simulation_mode:
-                cliped_arm_q_target = arm_q_target
-            else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                with self.ctrl_lock:
+                    arm_q_target     = self.q_target
+                    arm_tauff_target = self.tauff_target
 
-            for idx, id in enumerate(H1_JointArmIndex):
-                self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
-                self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
+                if self.simulation_mode:
+                    cliped_arm_q_target = arm_q_target
+                else:
+                    cliped_arm_q_target = self.clip_arm_q_target(
+                        arm_q_target, velocity_limit=self.arm_velocity_limit, dt=self._dt_ema
+                    )
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+                if (not np.all(np.isfinite(cliped_arm_q_target))
+                        or not np.all(np.isfinite(arm_tauff_target))):
+                    _warn_throttled("loop_nan", "non-finite command dropped in publish loop")
+                else:
+                    for idx, id in enumerate(H1_JointArmIndex):
+                        self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
+                        self.msg.motor_cmd[id].dq = 0
+                        self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
-            if self._speed_gradual_max is True:
-                t_elapsed = start_time - self._gradual_start_time
-                self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
+                    self.msg.crc = self.crc.Crc(self.msg)
+                    self.lowcmd_publisher.Write(self.msg)
 
-            current_time = time.time()
-            all_t_elapsed = current_time - start_time
-            sleep_time = max(0, (self.control_dt - all_t_elapsed))
-            time.sleep(sleep_time)
-            # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
-            # logger_mp.debug(f"sleep_time:{sleep_time}")
+                if self._speed_gradual_max is True:
+                    t_elapsed = start_time - self._gradual_start_time
+                    ratio = min(1.0, t_elapsed / self._gradual_time) if self._gradual_time else 1.0
+                    self.arm_velocity_limit = ARM_VELOCITY_LIMIT_START + (
+                        (ARM_VELOCITY_LIMIT_MAX - ARM_VELOCITY_LIMIT_START) * ratio
+                    )
+
+                all_t_elapsed = time.monotonic() - start_time
+                time.sleep(max(0.0, self.control_dt - all_t_elapsed))
+            except Exception:
+                logger_mp.exception("[arm] publish loop error, continuing")
+                time.sleep(0.01)
 
     def ctrl_dual_arm(self, q_target, tauff_target):
-        '''Set control target values q & tau of the left and right arm motors.'''
+        '''Set control target values q & tau of the left and right arm motors.
+
+        非有限值（NaN/Inf）或形状不符的输入在这里被拦下并保留上一帧有效目标。
+        上游 XR 追踪丢失时可能产生 NaN，若不拦会一路传到 CRC 与 DDS。
+        '''
+        q_target = np.asarray(q_target, dtype=float)
+        tauff_target = np.asarray(tauff_target, dtype=float)
+        if q_target.shape != self.q_target.shape or tauff_target.shape != self.tauff_target.shape:
+            _warn_throttled(
+                "cmd_shape",
+                f"ctrl_dual_arm shape mismatch: q{q_target.shape} tau{tauff_target.shape}",
+            )
+            return
+        if not np.all(np.isfinite(q_target)) or not np.all(np.isfinite(tauff_target)):
+            _warn_throttled("cmd_nan", "ctrl_dual_arm rejected non-finite target, keeping previous")
+            return
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
@@ -1035,30 +1401,23 @@ class H1_ArmController:
     
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
-        logger_mp.info("[H1_ArmController] ctrl_dual_arm_go_home start...")
-        max_attempts = 100
-        current_attempts = 0
+        logger_mp.info("[H1_ArmController] ctrl_dual_arm_go_home: hold current pose...")
         with self.ctrl_lock:
-            self.q_target = np.zeros(8)
-            # self.tauff_target = np.zeros(8)
-        tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
-        while current_attempts < max_attempts:
-            current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
-                logger_mp.info("[H1_ArmController] both arms have reached the home position.")
-                break
-            current_attempts += 1
-            time.sleep(0.05)
+            self.q_target = self.get_current_dual_arm_q().copy()
+        # H1 只走 debug 通道，没有 arm_sdk 权重需要卸载
+        logger_mp.info("[H1_ArmController] holding current pose.")
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
-        self._gradual_start_time = time.time()
+        # 必须与发布循环里的 time.monotonic() 同源，否则会算出巨大的 elapsed
+        self._gradual_start_time = time.monotonic()
         self._gradual_time = t
         self._speed_gradual_max = True
 
     def speed_instant_max(self):
         '''set arms velocity to the maximum value immediately, instead of gradually increasing.'''
-        self.arm_velocity_limit = 30.0
+        # 仿真没有物理约束，保留原量级；真机则用收紧后的上限
+        self.arm_velocity_limit = ARM_VELOCITY_LIMIT_SIM if self.simulation_mode else ARM_VELOCITY_LIMIT_MAX
 
     def _Is_weak_motor(self, motor_index):
         weak_motors = [

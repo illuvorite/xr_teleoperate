@@ -224,6 +224,21 @@ class IPC_Client:
         self.req_socket.connect("ipc://@xr_teleoperate_data.ipc")
         logger_mp.info("[IPC_Client] Connected to Data at ipc://@xr_teleoperate_data.ipc")
 
+    def _reset_req_socket(self) -> None:
+        """重建 REQ socket。
+
+        ZeroMQ 的 REQ 是严格 send/recv 交替：一旦发出请求但没收到应答，
+        socket 会停在 awaiting-reply 状态，下一次 send_json 直接抛 EFSM。
+        原实现超时后不重建，导致一次卡顿之后所有按键都"永久失灵"。
+        """
+        try:
+            self.req_socket.setsockopt(zmq.LINGER, 0)
+            self.req_socket.close()
+        except Exception:
+            pass
+        self.req_socket = self.ctx.socket(zmq.REQ)
+        self.req_socket.connect("ipc://@xr_teleoperate_data.ipc")
+
     def _make_reqid(self) -> str:
         import uuid
         return str(uuid.uuid4())
@@ -275,9 +290,12 @@ class IPC_Client:
             if self.req_socket.poll(1000):
                 reply = self.req_socket.recv_json()
             else:
+                # 不重建 socket 的话，下一次 send_json 会因 REQ 状态机卡死抛 EFSM
+                self._reset_req_socket()
                 return {"repid": reqid, "status": "error", "msg": "timeout waiting for server reply"}
         except Exception as e:
             logger_mp.error(f"[IPC_Client] send_data failed: {e}")
+            self._reset_req_socket()
             return {"repid": reqid, "status": "error", "msg": str(e)}
 
         if reply.get("status") != "ok":

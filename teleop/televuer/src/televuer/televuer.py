@@ -691,8 +691,10 @@ class TeleVuer:
             self.vuer.run()
         except KeyboardInterrupt:
             pass
-        except Exception as e:
-            print(f"Vuer encountered an error: {e}")
+        except Exception:
+            # 记录完整 traceback：原先只 print 异常摘要，Vuer 子进程死掉后
+            # 父进程完全不知情，主循环仍把 XR 数据当有效值用。
+            logging.exception("[TeleVuer] Vuer run crashed")
         finally:
             if hasattr(self, "stop_writer_event"):
                 self.stop_writer_event.set()
@@ -705,8 +707,16 @@ class TeleVuer:
             if self.latest_frame is None:
                 continue
             latest_frame = self.latest_frame
-            latest_frame = cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB)
-            self.img2display[:] = latest_frame
+            try:
+                latest_frame = cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB)
+                # 形状不匹配（例如双目配置下误传单目图）会在这里抛异常，
+                # 若不捕获，线程会静默死亡，XR 画面永久冻结且无任何日志。
+                self.img2display[:] = latest_frame
+            except Exception:
+                logging.exception(
+                    "[TeleVuer] render loop error: expected %s got %s",
+                    self.img2display.shape, getattr(latest_frame, "shape", None),
+                )
     
     def render_to_xr(self, image):
         if self.webrtc or self.display_mode == "pass-through":
