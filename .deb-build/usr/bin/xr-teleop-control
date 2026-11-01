@@ -1,0 +1,138 @@
+#!/bin/bash
+# xr-teleop-control — XR 遥操主控 CLI
+# 安装在 /usr/bin/,在 deb 装完后即可使用。
+set -e
+
+PROJECT_ROOT="/opt/xr-teleoperate-main"
+
+# 只管理两个常驻服务。xr-teleop 刻意不在列:
+# scripts/start_teleop.sh 属于高危脚本(会初始化 DDS 并接管机器人手臂),
+# 不允许注册为 systemd 服务、不允许 enable 开机自启、不允许被自动启动;
+# 需要时用 `xr-teleop-control teleop` 在终端里手动前台启动,
+# 或用 teleop-start / teleop-control / teleop-stop / teleop-status 做非交互人工启停
+# (委托给 scripts/start_teleop.sh,走主程序自带的 IPC 输入通道)。
+SERVICES=(xr-teleimager xr-heartbeat)
+
+NAME="${2:-all}"
+case "${1:-help}" in
+  install-env)
+    sudo -u unitree "$PROJECT_ROOT/.deb-build/scripts/postinstall_env.sh"
+    ;;
+  install-assets)
+    ARM="${2:-G1_29}"
+    echo "Downloading assets for --arm $ARM..."
+    # 占位 — 后续可以从内网/对象存储下载其它型号 mesh
+    echo "TODO: implement download for $ARM"
+    ;;
+  start)
+    # 只 start,不 enable —— 开机自启交给 `enable` 子命令,启动与自启互不耦合。
+    [ "$NAME" = "all" ] && NAMES=("${SERVICES[@]}") || NAMES=("$NAME")
+    for n in "${NAMES[@]}"; do systemctl start "$n"; done
+    ;;
+  teleop)
+    # 高危脚本:手动前台启动(不写 unit、不 enable)。Ctrl-C 结束。
+    echo "[xr-teleop-control] 手动启动遥操作主程序(高危:会接管机器人手臂)" >&2
+    exec sudo -u unitree bash "$PROJECT_ROOT/scripts/start_teleop.sh"
+    ;;
+  teleop-start|teleop-control|teleop-stop|teleop-status)
+    # 非交互人工启停(供部署器/远程调用):委托给包内包装脚本。
+    # start = 后台起进程(IPC 模式,不跟随);control = 等价按 R;stop = 等价按 Q;status = 回读状态。
+    WRAPPER="$PROJECT_ROOT/scripts/start_teleop.sh"
+    if [ ! -f "$WRAPPER" ]; then
+      echo "ERROR=未找到 $WRAPPER(该包版本不支持远程人工启停,请重新打包)" >&2
+      exit 1
+    fi
+    ACTION="${1#teleop-}"
+    exec sudo bash "$WRAPPER" "$ACTION"
+    ;;
+  stop)
+    [ "$NAME" = "all" ] && NAMES=("${SERVICES[@]}") || NAMES=("$NAME")
+    for n in "${NAMES[@]}"; do systemctl stop "$n"; done
+    ;;
+  restart)
+    [ "$NAME" = "all" ] && NAMES=("${SERVICES[@]}") || NAMES=("$NAME")
+    for n in "${NAMES[@]}"; do systemctl restart "$n"; done
+    ;;
+  status)
+    if [ "$NAME" = "all" ]; then
+      for n in "${SERVICES[@]}"; do
+        s=$(systemctl is-active "$n" 2>/dev/null || echo "inactive")
+        e=$(systemctl is-enabled "$n" 2>/dev/null || echo "disabled")
+        printf "  %-15s %-10s %-10s\n" "$n" "$s" "$e"
+      done
+    else
+      systemctl status --no-pager "$NAME"
+    fi
+    ;;
+  enable)
+    [ "$NAME" = "all" ] && NAMES=("${SERVICES[@]}") || NAMES=("$NAME")
+    for n in "${NAMES[@]}"; do systemctl enable "$n"; done
+    ;;
+  disable)
+    [ "$NAME" = "all" ] && NAMES=("${SERVICES[@]}") || NAMES=("$NAME")
+    for n in "${NAMES[@]}"; do systemctl disable "$n"; done
+    ;;
+  logs)
+    LOG="/var/log/xr-teleoperate/${NAME}.log"
+    if [ "$3" = "-f" ]; then tail -F "$LOG"; else tail -n 100 "$LOG"; fi
+    ;;
+  doctor)
+    echo "=== conda env tv ==="
+    sudo -u unitree "$HOME/miniconda3/bin/conda" env list 2>/dev/null | grep tv || echo "tv env MISSING"
+    echo "=== 端口 ==="
+    ss -tulpn 2>/dev/null | grep -E ":(8012|60001) " || echo "no listening on 8012/60001"
+    echo "=== 网卡 ==="
+    ip -4 addr 2>/dev/null | grep -E "wlan0|eth0" | head -5
+    echo "=== 心跳 ==="
+    BACKEND=$(grep XR_TELEOP_BACKEND_URL /etc/xr-teleoperate/env.conf 2>/dev/null | head -1 | cut -d= -f2)
+    echo "XR_TELEOP_BACKEND_URL=${BACKEND:-<unset>}"
+    WAN=$(grep -E "^XR_TELEOP_WAN_IP=" /etc/xr-teleoperate/env.conf 2>/dev/null | head -1 | cut -d= -f2)
+    echo "XR_TELEOP_WAN_IP=${WAN:-<unset, 运行时自动检测>}"
+    echo "=== 最近一次心跳上报 ==="
+    if [ -f /home/unitree/.cache/xr_teleoperate/last_heartbeat.json ]; then
+      cat /home/unitree/.cache/xr_teleoperate/last_heartbeat.json
+      echo
+    else
+      echo "  无缓存 —— 心跳从未成功上报(检查 XR_TELEOP_BACKEND_URL 与机器人网络)"
+    fi
+    ;;
+  uninstall)
+    systemctl stop "${SERVICES[@]}" 2>/dev/null || true
+    systemctl disable "${SERVICES[@]}" 2>/dev/null || true
+    # 历史版本可能残留过 xr-teleop unit,一并清理(见文件头说明)。
+    if [ -f /etc/systemd/system/xr-teleop.service ]; then
+      systemctl stop xr-teleop 2>/dev/null || true
+      systemctl disable xr-teleop 2>/dev/null || true
+      rm -f /etc/systemd/system/xr-teleop.service
+      systemctl daemon-reload
+    fi
+    dpkg --purge xr-teleoperate-main
+    ;;
+  help|*)
+    cat <<EOF
+xr-teleop-control <command> [name|arm]
+
+Commands:
+  install-env           创建 conda env 'tv' 并装依赖
+  install-assets [arm]   下载指定机器人型号 mesh(占位)
+  teleop                 手动前台启动遥操作主程序(高危,会接管机器人手臂;
+                         不注册 systemd 服务、不设开机自启)
+  teleop-start           后台启动遥操作主程序(IPC 模式,不跟随,机器人不动)
+  teleop-control         发送开始跟随指令(等价于在终端按 R)
+  teleop-stop            发送退出指令(等价于按 Q,程序执行手臂回零)
+  teleop-status          回读 TELEOP_* 状态(进程/是否已跟随)
+  start [name]           启动服务(name=all,仅 start 不 enable)
+  stop [name]
+  restart [name]
+  status [name]
+  enable [name]          设置开机自启(仅 enable,不启动)
+  disable [name]
+  logs <name> [-f]       查看日志
+  doctor                 体检 conda / 网 / / / 心跳
+  uninstall
+
+name:  xr-teleimager | xr-heartbeat | all
+注:   xr-teleop(start_teleop.sh)不在服务管理范围内,只允许手动启动。
+EOF
+    ;;
+esac

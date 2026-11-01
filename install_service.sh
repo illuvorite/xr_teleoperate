@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+# install_service.sh — CardModule 部署器调用的 systemd 安装脚本
+#
+# 用法(由 QS_RobotDeployer 调用):
+#   sudo ./install_service.sh install   --root <deploy-dir>
+#   sudo ./install_service.sh uninstall --root <deploy-dir>
+#   sudo ./install_service.sh status    --root <deploy-dir>
+#
+# 与部署器两个开关的对应关系(重要):
+#   install   ← 部署阶段。只写 unit + daemon-reload 并启动 ${SERVICE_SWITCH_SERVICE};
+#                xr-teleop 相关的一切(unit 生成 / enable / start)都不做。
+#   uninstall ← 「开机自启」开关关闭。disable ${SERVICE_SWITCH_SERVICE}(不 stop)。
+#   「服务开关」由部署器直接操作 card-module.json 的 service.name(= xr-teleimager):
+#   只做 systemctl start/stop,不经过本脚本。
+#
+# 高危脚本约束(必须保持):
+#   scripts/start_teleop.sh 会初始化 DDS 并接管机器人手臂,属于高危操作:
+#     - 不生成 xr-teleop.service,即不把它注册为后台常驻服务;
+#     - 不 enable(任何按钮/流程都不得把它设为开机自启),不开机自动启动;
+#     - 不 start/restart(部署、安装、开机序列里都不出现)。
+#   它只能由现场人员单独手动执行:
+#     sudo -u unitree bash <payload>/scripts/start_teleop.sh
+#   部署器侧还有硬性兜底:unit 名黑名单 + ExecStart 检查,见到即拒绝 enable/start。
+#
+# 本模块含两个 systemd 服务:
+#   xr-teleimager  头部双目相机 WebRTC 图像服务(60001);「服务开关」与「开机自启」目标
+#   xr-heartbeat   本机 wlan0 地址心跳上报(把地址报给 autobot-guide-service)
+#
+# dex1-1 夹爪服务刻意不做 systemd 常驻单元：它由 scripts/start_teleop.sh 在启动
+# 遥操前判重拉起(并先发一次 status=7 清电机锁存故障)。本脚本只负责把 unitree 加进
+# dialout 组 —— /dev/ttyUSB* 属主是 root:dialout，而 unitree 默认不在该组，
+# 不加组时夹爪服务打不开串口，遥操会卡在 "Waiting to subscribe dds..."。
+#
+# 另有一个内部子命令(不面向部署器,由 xr-teleimager.service 的 ExecStartPre 以 root 调用):
+#   tune-usb       写 RealSense 必需的 USB 内核参数(usbfs_memory_mb=1000 等)
+#
+# 两种包形态共用本脚本,脚本自行定位 payload:
+#   deb : <root>/opt/xr-teleoperate-main/   (dpkg-deb -x 解出的目录树)
+#   zip : <root>/                            (解压后即为 payload 根)
+#
+# 首次部署提示:运行依赖 conda 环境 tv。若机器人上还没有该环境,健康检查会失败,
+# 需先执行(耗时较长,会下载 3GB+ 依赖):
+#     sudo -u unitree xr-teleop-control install-env
+# 也可用 XR_TELEOP_INSTALL_ENV=1 让本脚本在安装时顺带创建。
+
+set -euo pipefail
+
+# 只管理两个常驻服务;xr-teleop 刻意不在列 —— 高危脚本不得注册为 systemd 服务。
+SERVICES=(xr-teleimager xr-heartbeat)
+SERVICE_SWITCH_SERVICE="xr-teleimager"  # 「服务开关」/「开机自启」目标(与 card-module.json 的 service.name 一致)
+ENV_DIR="/etc/xr-teleoperate"
+ENV_FILE="$ENV_DIR/env.conf"
+UNIT_DIR="/etc/systemd/system"
+LOG_DIR="/var/log/xr-teleoperate"
+SERVICE_USER="unitree"
+
+# ---------------------------------------------------------------------------
+# tune-usb：RealSense 取流必需的 USB 内核参数
+# ---------------------------------------------------------------------------
+# 背景(2026-09-28 线上故障)：RealSense 在 Linux 上要求 usbfs 内存上限 >= 1000MB，
+# 内核默认只有 16MB，上限过小会依次表现为：
+#   dmesg : uvcvideo: Failed to resubmit video URB (-1)
+#   dmesg : usb 2-2.1: reset SuperSpeed Gen 1 USB device
+#   应用  : [Image Server] Error updating frame for head_camera camera:
+#           RuntimeError: Frame didn't arrive within 5000
+# 最终图像服务在运行几分钟后自杀、被 systemd 反复重启。
+#
+# usbcore 在 Jetson(Tegra)上是内建模块而不是 .ko，/etc/modprobe.d 的 options 不生效，
+# 只能直接写 sysfs；而 sysfs 这两个文件都只有 root 能写，所以由 xr-teleimager.service
+# 的 ExecStartPre 以 root 执行本子命令(unit 里用 "+" 前缀无视 User= 提权)。
+#
+# 注意：本函数始终返回 0 —— 它是服务启动的前置步骤，调优失败不应该阻断服务启动，
+# 只在日志里留下明确告警(日志见 /var/log/xr-teleoperate/xr-teleimager.log)。
+tune_usb_for_realsense() {
+    local want_mb="${USBFS_MEMORY_MB:-1000}"
+    local param=/sys/module/usbcore/parameters/usbfs_memory_mb
+
+    if [[ -e "$param" ]]; then
+        local cur
+        cur="$(cat "$param" 2>/dev/null || echo '?')"
+        if [[ "$cur" == "$want_mb" ]]; then
+            echo "[tune-usb] usbfs_memory_mb 已是 $want_mb"
+        elif echo "$want_mb" > "$param" 2>/dev/null; then
+            echo "[tune-usb] usbfs_memory_mb: $cur -> $want_mb"
+        else
+            echo "[tune-usb] 警告：写入 usbfs_memory_mb 失败(需要 root)" >&2
+        fi
+    else
+        echo "[tune-usb] 跳过 usbfs_memory_mb：$param 不存在(非 Linux usbcore 环境?)"
+    fi
+
+    # 关闭 RealSense 的 USB 自动挂起：相机空闲时被内核挂起后恢复取流可能失败。
+    # 机器人上 8086(Intel)只有 RealSense 这一颗 USB 设备，按 VID 匹配即可。
+    local f dev tuned=0
+    for f in /sys/bus/usb/devices/*/idVendor; do
+        [[ -r "$f" ]] || continue
+        [[ "$(cat "$f" 2>/dev/null || true)" == "8086" ]] || continue
+        dev="${f%/idVendor}"
+        if [[ -w "$dev/power/control" ]] && echo on > "$dev/power/control" 2>/dev/null; then
+            echo "[tune-usb] $(basename "$dev") power/control -> on"
+            tuned=1
+        fi
+    done
+    [[ "$tuned" -eq 1 ]] || echo "[tune-usb] 未发现 RealSense USB 设备，已跳过电源管理调整"
+
+    return 0
+}
+
+usage() {
+    cat <<EOF
+用法:
+    $0 <install|uninstall|status> --root <deploy-dir>
+    $0 tune-usb
+
+必传参数:
+    --root <deploy-dir>   CardModule 解压后的部署根目录(install/uninstall/status 必填)
+
+子命令语义:
+    install     安装/刷新 unit 并启动 ${SERVICE_SWITCH_SERVICE}(不登记开机自启;不涉及 xr-teleop)
+    uninstall   取消 ${SERVICE_SWITCH_SERVICE} 开机自启(不 stop)
+    status      输出 ${SERVICES[*]} 的 active/enabled 状态
+    reset-camera  复位 RealSense 的 USB 设备（内部子命令，由 ExecStopPost 以 root 调用）
+    tune-usb    写 RealSense 必需的 USB 内核参数(usbfs_memory_mb=1000、关闭 USB 自动挂起)。
+                内部子命令,由 xr-teleimager.service 的 ExecStartPre 以 root 调用,需 root 权限。
+
+说明:
+    scripts/start_teleop.sh 属于高危脚本,不生成 unit、不 enable、不 start,
+    只能由现场人员单独手动执行。
+
+可选环境变量:
+    XR_TELEOP_INSTALL_ENV=1   安装时顺带创建 conda 环境 tv(耗时较长)
+    USBFS_MEMORY_MB           tune-usb 使用的 usbfs 内存上限,默认 1000(MB)
+EOF
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+fi
+
+ACTION="$1"
+shift
+
+ROOT_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --root)
+            shift
+            ROOT_DIR="${1:-}"
+            ;;
+        *)
+            echo "未知参数: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# ---------------------------------------------------------------------------
+# reset-camera：把 RealSense 从「半死」状态救回来
+# ---------------------------------------------------------------------------
+# 背景：teleimager 被 SIGKILL 时（systemd TimeoutStopSec 到点强杀），UVC 节点
+# 来不及释放，相机停在「USB 上还在、但只枚举出 2 个 /dev/videoN」的状态。
+# 下一个进程再打开就失败，表现为「服务活着但 60001 不出图」，现场只能拔插 USB。
+# 这里在服务停止后（ExecStopPost，以 root 运行）做一次 USB 级复位，
+# 保证下一次启动总能拿到干净的设备。
+reset_camera_usb() {
+    local dev vid found=0
+    for dev in /sys/bus/usb/devices/*; do
+        [[ -r "$dev/idVendor" ]] || continue
+        vid="$(cat "$dev/idVendor" 2>/dev/null || true)"
+        [[ "$vid" == "8086" ]] || continue
+        found=1
+        echo "[reset-camera] 复位 $(basename "$dev")（RealSense $vid）"
+        if ! echo 0 > "$dev/authorized" 2>/dev/null; then
+            echo "[reset-camera] 警告：无法写 $dev/authorized（需要 root）" >&2
+            continue
+        fi
+        sleep 2
+        echo 1 > "$dev/authorized" 2>/dev/null || true
+        sleep 3
+    done
+    [[ "$found" -eq 1 ]] || echo "[reset-camera] 未发现 RealSense，跳过"
+    return 0
+}
+
+# 内部子命令不需要部署目录（由 unit 的 ExecStartPre / ExecStopPost 以 root 调用）。
+if [[ "$ACTION" == "tune-usb" ]]; then
+    tune_usb_for_realsense
+    exit $?
+fi
+if [[ "$ACTION" == "reset-camera" ]]; then
+    reset_camera_usb
+    exit $?
+fi
+
+if [[ -z "$ROOT_DIR" ]]; then
+    echo "缺少 --root 参数" >&2
+    usage
+    exit 1
+fi
+
+if [[ ! -d "$ROOT_DIR" ]]; then
+    echo "部署目录不存在: $ROOT_DIR" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 定位 payload 根(含 scripts/start_teleop.sh 的那一层)
+# ---------------------------------------------------------------------------
+locate_payload() {
+    local root="$1"
+
+    # zip 形态:解压后就是 payload 根
+    if [[ -f "$root/scripts/start_teleop.sh" ]]; then
+        echo "$root"
+        return 0
+    fi
+
+    # deb 形态:dpkg-deb -x 解出的目录树
+    if [[ -f "$root/opt/xr-teleoperate-main/scripts/start_teleop.sh" ]]; then
+        echo "$root/opt/xr-teleoperate-main"
+        return 0
+    fi
+
+    # 兜底:在 root 下搜索(留足余量,兼容多套一层目录的打包方式)
+    local found
+    found="$(find "$root" -maxdepth 6 -type f -name start_teleop.sh -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        (cd "$(dirname "$found")/.." && pwd)
+        return 0
+    fi
+
+    return 1
+}
+
+PAYLOAD="$(locate_payload "$ROOT_DIR" || true)"
+if [[ -z "$PAYLOAD" ]]; then
+    echo "未能在 $ROOT_DIR 下找到 payload(scripts/start_teleop.sh)" >&2
+    exit 1
+fi
+
+echo "[install_service] deploy-root = $ROOT_DIR"
+echo "[install_service] payload     = $PAYLOAD"
+
+# ---------------------------------------------------------------------------
+# 生成 unit
+# ---------------------------------------------------------------------------
+write_units() {
+    local payload="$1"
+
+    # 刻意不生成 xr-teleop.service:
+    #   ExecStart 会指向 scripts/start_teleop.sh(高危脚本),一旦存在 unit,
+    #   任何人都可能 systemctl enable/start 它,等价于把它注册成后台常驻服务 + 开机自启。
+    #   因此这里连带清理历史版本可能残留的 unit(升级场景),确保现场不会再有该服务。
+    if [[ -f "$UNIT_DIR/xr-teleop.service" ]]; then
+        systemctl stop xr-teleop 2>/dev/null || true
+        systemctl disable xr-teleop 2>/dev/null || true
+        rm -f "$UNIT_DIR/xr-teleop.service"
+        echo "[install_service] 已移除历史残留的高危 unit: xr-teleop.service(仅允许手动启动 start_teleop.sh)"
+    fi
+
+    # 刻意不生成 xr-usb-tuning.service（历史版本曾用过）：RealSense 需要的 USB 内核参数
+    # 改由下面 xr-teleimager 的 ExecStartPre 直接调用本脚本的 tune-usb 子命令完成，
+    # 少一个 unit、也少一个独立脚本文件。这里顺带清理升级场景可能残留的旧 unit。
+    if [[ -f "$UNIT_DIR/xr-usb-tuning.service" ]]; then
+        systemctl stop xr-usb-tuning 2>/dev/null || true
+        systemctl disable xr-usb-tuning 2>/dev/null || true
+        rm -f "$UNIT_DIR/xr-usb-tuning.service"
+        echo "[install_service] 已移除历史残留的 xr-usb-tuning.service（逻辑已并入 ExecStartPre）"
+    fi
+
+    cat > "$UNIT_DIR/xr-teleimager.service" <<EOF
+[Unit]
+Description=XR Teleimager (Image Server) - 60001
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+WorkingDirectory=${payload}
+EnvironmentFile=-${ENV_FILE}
+# RealSense 要求 usbfs 内存上限 >= 1000MB（内核默认 16MB），过小会导致
+# "Failed to resubmit video URB" / "Frame didn't arrive within 5000" / USB 链路复位，
+# 图像服务跑几分钟后自杀。usbcore 在 Jetson 上是内建模块（modprobe.d 不生效），
+# 且相关 sysfs 只有 root 能写 —— 故用 "+" 前缀无视 User= 提权执行 tune-usb 子命令。
+# 相机独占：官方 master_service 会在 USB 相机出现后自动拉起 videohub_pc4，抓住
+# RealSense 的 /dev/video4 UVC 节点不放，导致 RealSense 初始化
+# xioctl(VIDIOC_S_FMT) Device or resource busy、本服务反复重启。
+# 故启动前先用 root 把它请走（方括号写法防 pkill 误杀自身命令行；
+# 本来就没在跑也视为成功）。一相机只能喂一路，遥操优先。
+ExecStartPre=+/bin/bash -c 'pkill -f "[v]ideohub_pc4 /dev/video4" || true; sleep 1; exit 0'
+ExecStartPre=+/bin/bash ${payload}/install_service.sh tune-usb
+ExecStart=${payload}/scripts/start_camera.sh
+# 停止后复位相机：被强杀时 UVC 节点来不及释放，不复位会让下一次启动打不开相机
+# （USB 上还在、但只枚举出 2 个 /dev/videoN，pyrealsense2 报 0 设备）。
+ExecStopPost=+/bin/bash ${payload}/install_service.sh reset-camera
+Restart=on-failure
+RestartSec=5
+# 启动阶段要做相机探测（SCAM 枚举 / RealSense 枚举 / 夹爪握手），实测 10~15s，
+# 默认 90s 够用，显式放宽到 120s 防止慢盘/首启误杀。
+TimeoutStartSec=120s
+# 重启风暴保护：相机缺失或 SCAM 的 glibc 缺文件时脚本会快速失败，
+# 没有这个限制 systemd 会每 5 秒重启一次，把日志刷爆还掩盖真正原因。
+# 60 秒内连续 5 次失败就停手，状态置 failed 让部署器能看见。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# teleimager-server 不处理 SIGTERM：systemd 默认 TimeoutStopSec=90s，停止期间服务
+# 会卡在 deactivating，部署器这时点「启动」直接报「服务当前状态: 0 / deactivating」。
+# 缩到 8s：留一点清理时间，又不让停止流程长时间挂住（超时后 systemd 自己 SIGKILL）。
+TimeoutStopSec=8s
+StandardOutput=append:${LOG_DIR}/xr-teleimager.log
+StandardError=append:${LOG_DIR}/xr-teleimager.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 心跳上报本机地址(不再依赖 xr-teleop:它只允许人工手动启动,不能作为启动前置)。
+    cat > "$UNIT_DIR/xr-heartbeat.service" <<EOF
+[Unit]
+Description=XR Teleoperator Heartbeat - reports robot address to backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+WorkingDirectory=${payload}
+EnvironmentFile=-${ENV_FILE}
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/bin/env python3 ${payload}/scripts/heartbeat_register.py
+Restart=always
+RestartSec=30
+StandardOutput=append:${LOG_DIR}/xr-heartbeat.log
+StandardError=append:${LOG_DIR}/xr-heartbeat.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 子命令
+# ---------------------------------------------------------------------------
+do_install() {
+    # 1. 运行目录
+    mkdir -p "$LOG_DIR"
+    chown -R "${SERVICE_USER}:${SERVICE_USER}" "$LOG_DIR" 2>/dev/null || true
+
+    # 2. env.conf —— conffile 语义:已存在则保留现场改动
+    mkdir -p "$ENV_DIR"
+    if [[ ! -f "$ENV_FILE" ]]; then
+        local seed=""
+        for cand in "$PAYLOAD/.deb-build/etc/xr-teleoperate/env.conf" "$PAYLOAD/env.conf"; do
+            if [[ -f "$cand" ]]; then
+                seed="$cand"
+                break
+            fi
+        done
+        if [[ -n "$seed" ]]; then
+            cp "$seed" "$ENV_FILE"
+            echo "[install_service] 已从包内生成 $ENV_FILE"
+        else
+            cat > "$ENV_FILE" <<'EOF'
+# 由 install_service.sh 生成的默认配置;完整说明见包内
+# .deb-build/etc/xr-teleoperate/env.conf
+XR_TELEOP_ROBOT_ID=g1_001
+XR_TELEOP_PUBLIC_PORT=8012
+XR_TELEOP_HEARTBEAT_INTERVAL=30
+# 心跳上报目标(wanIp:port 是前端遥操直连模式的数据源,不可留空)
+XR_TELEOP_BACKEND_URL=https://hhqskj.com
+EOF
+            echo "[install_service] 已生成默认 $ENV_FILE"
+        fi
+    else
+        echo "[install_service] 保留已有 $ENV_FILE"
+    fi
+
+    # 3. 权限
+    chown -R "${SERVICE_USER}:${SERVICE_USER}" "$PAYLOAD" 2>/dev/null || true
+    find "$PAYLOAD/scripts" -type f -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
+    # 夹爪服务(third_party/dex1_1_service)由 start_teleop.sh 以 unitree 身份拉起,
+    # 需要读写 /dev/ttyUSB*(root:dialout, 660)。unitree 默认不在 dialout 组,
+    # 这里补上;之后 sudo -u unitree 起的新会话就会带上该组。
+    if getent group dialout >/dev/null 2>&1; then
+        if id -nG "$SERVICE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx dialout; then
+            echo "[install_service] $SERVICE_USER 已在 dialout 组"
+        elif usermod -aG dialout "$SERVICE_USER" 2>/dev/null; then
+            echo "[install_service] 已把 $SERVICE_USER 加入 dialout 组(夹爪串口权限)"
+        else
+            echo "[install_service] WARN: 加入 dialout 组失败,夹爪可能打不开 /dev/ttyUSB*" >&2
+        fi
+    fi
+    # 预编译的 arm64 产物:补执行位(部署包在 Windows 上打包,解压后没有 unix 执行位)
+    if [[ -d "$PAYLOAD/third_party/dex1_1_service/bin" ]]; then
+        chmod +x "$PAYLOAD/third_party/dex1_1_service/bin/"* 2>/dev/null || true
+    fi
+    # 部署包是在 Windows 上打包的：解压后文件没有 unix 执行位（666，目录 777），
+    # 而 scam 后端的 glibc-2.35 加载器（vendor/glibc235/.../ld-linux-aarch64.so.1）必须可执行，
+    # 否则 start_camera.sh 只能回退到系统上的 /home/unitree/glibc235。这里统一补上。
+    find "$PAYLOAD/teleop/teleimager/vendor" -name 'ld-linux*.so*' -exec chmod 755 {} + 2>/dev/null || true
+
+    # 4. 管理 CLI(把 PROJECT_ROOT 指向本次 payload,使 install-env 也能用)
+    local cli_src="$PAYLOAD/.deb-build/usr/bin/xr-teleop-control"
+    if [[ -f "$cli_src" ]]; then
+        sed "s#^PROJECT_ROOT=.*#PROJECT_ROOT=\"${PAYLOAD}\"#" "$cli_src" > /usr/bin/xr-teleop-control
+        chmod 755 /usr/bin/xr-teleop-control
+        echo "[install_service] 已安装 CLI: /usr/bin/xr-teleop-control"
+    fi
+
+    # 5. 写 unit(xr-teleimager / xr-heartbeat;不生成 xr-teleop)
+    write_units "$PAYLOAD"
+    systemctl daemon-reload
+
+    # 注：RealSense 的 USB 内核参数不需要在这里单独处理 —— 第 7 步 restart xr-teleimager
+    #     时，unit 的 ExecStartPre 会自动以 root 跑一次 tune-usb。
+
+    # 6. 高危脚本:scripts/start_teleop.sh 不生成 unit、不 enable、不 start。
+    #    它只在现场需要遥操作时由人工单独执行:
+    #        sudo -u ${SERVICE_USER} bash ${PAYLOAD}/scripts/start_teleop.sh
+    echo "[install_service] 高危脚本未注册为服务(仅允许手动启动): scripts/start_teleop.sh"
+
+    # 7. 「服务开关」目标:启动相机图像服务。
+    #    部署器的「服务开关」只做 systemctl start/stop;这里的 enable 是该 unit 的包级默认
+    #    (模块基线服务,需开机自启),与「开机自启」开关显示的是同一个 unit,两者互不耦合:
+    #    enable/disable 只管开机自启,start/stop 只管当前运行。
+    systemctl enable "$SERVICE_SWITCH_SERVICE" >/dev/null 2>&1 || true
+    if systemctl restart "$SERVICE_SWITCH_SERVICE"; then
+        echo "[install_service] started: ${SERVICE_SWITCH_SERVICE}"
+    else
+        echo "[install_service] WARN: ${SERVICE_SWITCH_SERVICE} 启动失败,查看: journalctl -u ${SERVICE_SWITCH_SERVICE} -n 200" >&2
+    fi
+
+    # 8. 心跳上报(不是 start_*.sh,只负责把本机地址报给后端)。
+    #    不跑它控制台就拿不到机器人地址,只能回退静态配置,故一并拉起。
+    systemctl enable xr-heartbeat >/dev/null 2>&1 || true
+    systemctl restart xr-heartbeat >/dev/null 2>&1 \
+        || echo "[install_service] WARN: xr-heartbeat 启动失败" >&2
+
+    # 9. 可选:顺带创建 conda 环境(默认不做,避免部署超时)
+    if [[ "${XR_TELEOP_INSTALL_ENV:-0}" == "1" && -f "$PAYLOAD/.deb-build/scripts/postinstall_env.sh" ]]; then
+        echo "[install_service] XR_TELEOP_INSTALL_ENV=1,创建 conda 环境 tv(耗时较长)..."
+        sudo -u "$SERVICE_USER" "$PAYLOAD/.deb-build/scripts/postinstall_env.sh" || \
+            echo "[install_service] WARN: 创建 conda 环境失败,请稍后手动执行 install-env" >&2
+    fi
+
+    echo "[install_service] done. 若机器人尚无 conda 环境 tv,请先执行:"
+    echo "[install_service]   sudo -u ${SERVICE_USER} xr-teleop-control install-env"
+}
+
+do_uninstall() {
+    # 本脚本的 uninstall 由部署器「开机自启」开关触发,语义是"取消开机自启",
+    # 不是卸载模块、也不 stop 服务(停服务属于「服务开关」)。
+    systemctl disable "$SERVICE_SWITCH_SERVICE" 2>/dev/null || true
+    echo "[install_service] 已取消开机自启: ${SERVICE_SWITCH_SERVICE}"
+    echo "[install_service] (未停止服务,也未涉及 xr-heartbeat;高危脚本 start_teleop.sh 仅手动启动)"
+}
+
+do_status() {
+    for s in "${SERVICES[@]}"; do
+        printf '%s: active=%s enabled=%s\n' "$s" \
+            "$(systemctl is-active "$s" 2>/dev/null || true)" \
+            "$(systemctl is-enabled "$s" 2>/dev/null || true)"
+    done
+    # 服务开关对应的 unit 状态单独输出一次,供部署器旁路读取
+    systemctl is-active "$SERVICE_SWITCH_SERVICE" 2>/dev/null || true
+}
+
+case "$ACTION" in
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+    status)    do_status ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

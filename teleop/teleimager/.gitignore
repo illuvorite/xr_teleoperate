@@ -1,0 +1,6 @@
+# teleimager runtime artifacts
+teleimager_auto.log
+.teleimager.pid
+__pycache__/
+*.pyc
+*.pyo

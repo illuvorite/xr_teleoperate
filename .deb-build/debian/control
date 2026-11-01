@@ -1,0 +1,25 @@
+Package: xr_teleoperate
+Version: 1.0.0
+Section: robotics
+Priority: optional
+Architecture: arm64
+Maintainer: illusory <1596303130@qq.com>
+Depends: bash, coreutils, openssl, ca-certificates, iproute2, net-tools, systemd, sudo
+Recommends: libgl1, libgomp1, ssh-server, kmod
+Description: XR Teleoperator main program (Unitree G1_29)
+ Installs the VR teleoperator code at /opt/xr-teleoperate-main,
+ two systemd units (xr-teleimager, xr-heartbeat), and
+ the helper CLI /usr/bin/xr-teleop-control.
+ .
+ The high-risk VR teleop program scripts/start_teleop.sh is NOT
+ registered as a systemd service (no enable, no autostart); it must be
+ launched manually on site: xr-teleop-control teleop
+ .
+ At install time, a postinst step installs Miniconda (if missing) and
+ reloads systemd. The user then runs `xr-teleop-control install-env`
+ to create the 'tv' conda environment with all Python deps
+ (see /opt/xr-teleoperate-main/.deb-build/tv-env.yml).
+ .
+ After install: sudo -u unitree xr-teleop-control install-env
+ Then:          xr-teleop-control start
+ .

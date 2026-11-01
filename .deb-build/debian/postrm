@@ -1,0 +1,10 @@
+#!/bin/bash
+# postrm — invoked after removal. Cleans up only on purge.
+set -e
+
+if [ "$1" = "purge" ]; then
+  rm -rf /etc/xr-teleoperate
+  rm -rf /var/log/xr-teleoperate
+fi
+
+exit 0

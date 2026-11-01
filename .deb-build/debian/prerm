@@ -1,0 +1,20 @@
+#!/bin/bash
+# prerm — invoked before removal of package (including "purge")
+set -e
+
+# 只处理本包注册的两个常驻服务。
+# xr-teleop 不在包内注册(高危脚本 start_teleop.sh 仅允许手动启动),
+# 但历史版本可能残留过该 unit,这里顺手清理,避免残留在 /etc/systemd/system 里
+# 被人误 enable 成开机自启。
+for svc in xr-teleimager xr-heartbeat; do
+  systemctl stop "$svc" 2>/dev/null || true
+  systemctl disable "$svc" 2>/dev/null || true
+done
+
+if [ -f /etc/systemd/system/xr-teleop.service ]; then
+  systemctl stop xr-teleop 2>/dev/null || true
+  systemctl disable xr-teleop 2>/dev/null || true
+  rm -f /etc/systemd/system/xr-teleop.service
+fi
+
+exit 0

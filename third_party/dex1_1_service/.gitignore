@@ -1,0 +1,10 @@
+*build/
+.vscode/
+*.pyc
+*pycache*
+
+# bin/ 里是预编译的 arm64 产物，需要入库：
+# 部署包直接跑二进制，不在机器人上编译（机器人不一定有 cmake/g++/libserialport-dev）。
+# 调用方见 xr_teleoperate/scripts/start_xr_teleop.sh 与 install_service.sh。
+!bin/
+!bin/*

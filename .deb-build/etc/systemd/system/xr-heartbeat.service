@@ -1,0 +1,18 @@
+[Unit]
+Description=XR Teleoperator Heartbeat - reports robot address to backend
+After=network-online.target xr-teleimager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/opt/xr-teleoperate-main
+EnvironmentFile=-/etc/xr-teleoperate/env.conf
+# Heartbeat 在相机服务启动后上报 IP
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/unitree/miniconda3/envs/tv/bin/python /opt/xr-teleoperate-main/scripts/heartbeat_register.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

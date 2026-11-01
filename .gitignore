@@ -1,0 +1,46 @@
+.idea/
+__MACOSX/
+.DS_Store
+*pycache*
+*.pyc
+*.egg-info
+*.mp4
+*build/
+*.pem
+*.webm
+*.jpg
+*.svo
+*.png
+!video_cover.jpg
+!head_camera_mount_install.png
+!head_camera_mount.png
+!real_head.jpg
+!real_left_hand.jpg
+!real_right_hand.jpg
+!wrist_and_ring_mount.png
+!video_cover2.jpg
+teleop/data/
+episode_0*
+.vscode/
+*.pkl
+# 前端构建产物(由 scripts 生成,不入库)
+dist/
+# AI 编码插件(Kilo Code)的隔离工作区副本,只应在本地存在
+.kilo/
+.workbuddy-ai/
+# Debian installation templates are source inputs for release packages.
+!.deb-build/
+# teleimager 运行期产物:日志 / 相机后端状态标记 / pid 文件(都不应入库)
+teleop/teleimager/teleimager_auto.log
+teleop/teleimager/.teleimager_last_type
+teleop/teleimager/teleimager_auto_switcher.pid
+# 本地备份文件（IMU 分支曾误入库 *.bak，此处统一忽略）
+*.bak
+*.bak-*
+# 保留 vendor 目录结构（相机 SDK + 运行时库）
+!teleop/teleimager/vendor/
+!teleop/teleimager/vendor/camera_sdk_test/build/
+!teleop/teleimager/vendor/camera_sdk_test/build/*.so
+!teleop/teleimager/vendor/camera_sdk_test/build/libsyncsdk_*.so
+!teleop/teleimager/vendor/glibc235/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+!teleop/teleimager/vendor/glibc235/lib/aarch64-linux-gnu/libc.so.6

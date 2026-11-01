@@ -1,0 +1,2292 @@
+# Copyright 2025 YuShu TECHNOLOGY CO.,LTD ("Unitree Robotics")
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging_mp
+logging_mp.basicConfig(level=logging_mp.INFO)
+logger_mp = logging_mp.getLogger(__name__)
+import os
+import argparse
+import glob
+import cv2
+import numpy as np
+# uvc will be imported when needed
+import yaml
+import time
+import threading
+import signal
+import functools
+import subprocess
+import platform
+from .image_client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
+# 机器人状态采集（原独立服务 robot-agent:8013，已合并进本服务 60001）
+from .bms_state import ensure_worker as _ensure_bms_worker, system_status as _bms_system_status
+# webrtc dependencies
+import asyncio
+import json
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from aiortc.rtcrtpsender import RTCRtpSender
+from aiortc.contrib.media import MediaRelay
+from aiortc.codecs import h264
+import av
+import ssl
+from pathlib import Path
+import queue
+import fractions
+from typing import Dict, Optional, Tuple, Any
+
+# ========================================================
+# cam_config_server.yaml path
+# ========================================================
+from pathlib import Path
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "cam_config_server.yaml"
+)
+CONFIG_PATH = os.path.normpath(CONFIG_PATH)
+
+# ========================================================
+# certificate and key paths
+# ========================================================
+module_dir = Path(__file__).resolve().parent.parent.parent
+default_cert = module_dir / "cert.pem"
+default_key = module_dir / "key.pem"
+env_cert = os.getenv("XR_TELEOP_CERT")
+env_key = os.getenv("XR_TELEOP_KEY")
+user_config_dir = Path.home() / ".config" / "xr_teleoperate"
+user_cert = user_config_dir / "cert.pem"
+user_key = user_config_dir / "key.pem"
+CERT_PEM_PATH = Path(env_cert or (user_cert if user_cert.exists() else default_cert))
+KEY_PEM_PATH = Path(env_key or (user_key if user_key.exists() else default_key))
+CERT_PEM_PATH = CERT_PEM_PATH.resolve()
+KEY_PEM_PATH = KEY_PEM_PATH.resolve()
+
+# ========================================================
+# libx264 for Jetson (Patch h264 Encoder)
+# ========================================================
+# H264 软编码率(单位 bps):提高画质。默认 6Mbps,可由 cam_config 的 bitrate 字段覆盖。
+_H264_ENCODE_BITRATE = 6_000_000
+# 编码器帧率,需与相机采集 fps 对齐(否则按错帧率算码率,实际码率会减半)。
+_H264_FRAMERATE = 30
+
+
+def jetson_software_encode_frame(self, frame: av.VideoFrame, force_keyframe: bool):
+    if self.codec and (frame.width != self.codec.width or frame.height != self.codec.height):
+        self.codec = None
+
+    if self.codec is None:
+        try:
+            self.codec = av.CodecContext.create("libx264", "w")
+            self.codec.width = frame.width
+            self.codec.height = frame.height
+            self.codec.bit_rate = _H264_ENCODE_BITRATE
+            self.codec.pix_fmt = "yuv420p"
+            self.codec.framerate = fractions.Fraction(_H264_FRAMERATE, 1)
+            self.codec.time_base = fractions.Fraction(1, _H264_FRAMERATE)
+        
+            self.codec.options = {
+                "preset": "ultrafast",
+                "tune": "zerolatency",
+                # Use a few CPU threads on Jetson, but leave cores available
+                # for capture, WebRTC, DDS, and robot control.
+                "threads": str(min(6, max(1, (os.cpu_count() or 2) - 2))),
+                "sliced-threads": "1",
+                "bf": "0",
+                "rc-lookahead": "0",
+                "sync-lookahead": "0",
+                "g": "10",
+                "keyint": "10",
+                "min-keyint": "10",
+                "scenecut": "0",
+            }
+            self.frame_count = 0
+            force_keyframe = True
+        except Exception as e:
+            logger_mp.error(f"[H264 Patch] Initialization failed: {e}")
+            return
+
+    if not force_keyframe and hasattr(self, "frame_count") and self.frame_count % 60 == 0:
+        force_keyframe = True
+    
+    self.frame_count = self.frame_count + 1 if hasattr(self, "frame_count") else 1
+    frame.pict_type = av.video.frame.PictureType.I if force_keyframe else av.video.frame.PictureType.NONE
+
+    try:
+        for packet in self.codec.encode(frame):
+            data = bytes(packet)
+            if data:
+                yield from self._split_bitstream(data)
+    except Exception as e:
+        logger_mp.warning(f"[H264 Patch] Encode error: {e}")
+
+def jetson_hw_or_soft_encode_frame(self, frame, force_keyframe):
+    """NVENC hardware encode first, libx264 software fallback.
+
+    The aiortc H264Encoder instance carries the pipeline on itself
+    (_jetson_hw / _jetson_hw_state); once NVENC fails the encoder stays
+    on the software path so a GPU hiccup can never black out the feed.
+    """
+    state = getattr(self, "_jetson_hw_state", "unset")
+    if state == "unset":
+        try:
+            from .hw_h264_jetson import JetsonNvEncH264
+
+            hw = JetsonNvEncH264(frame.width, frame.height, _H264_ENCODE_BITRATE, _H264_FRAMERATE)
+            hw.start()
+            self._jetson_hw = hw
+            self._jetson_hw_state = "ok"
+            logger_mp.info(
+                "[Hw264] NVENC pipeline active (%dx%d @ %d bps, iframeinterval=%d)",
+                frame.width, frame.height, _H264_ENCODE_BITRATE, hw.iframeinterval,
+            )
+        except Exception as exc:
+            logger_mp.warning("[Hw264] NVENC init failed: %s; using software encoder", exc)
+            self._jetson_hw_state = "failed"
+    if getattr(self, "_jetson_hw_state", "unset") == "ok":
+        try:
+            bgr = frame.to_ndarray(format="bgr24")
+            data = self._jetson_hw.encode_frame(bgr.tobytes(), force_keyframe)
+            if data:
+                yield from self._split_bitstream(data)
+            return
+        except Exception as exc:
+            logger_mp.warning("[Hw264] NVENC encode error: %s; falling back to software", exc)
+            self._jetson_hw_state = "failed"
+            try:
+                self._jetson_hw.close()
+            except Exception:
+                pass
+    yield from jetson_software_encode_frame(self, frame, force_keyframe)
+
+
+h264.H264Encoder._encode_frame = jetson_hw_or_soft_encode_frame
+
+# ========================================================
+# Embed HTML and JS directly
+# ========================================================
+INDEX_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TeleImager Camera</title>
+    <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; }
+    body { font-family: Arial, Helvetica, sans-serif; color: #fff; }
+    #media, #video { width: 100%; height: 100%; }
+    #video { display: block; background: #000; object-fit: contain; }
+    #overlay {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+    }
+    #status {
+        position: absolute;
+        left: max(18px, env(safe-area-inset-left));
+        bottom: max(18px, env(safe-area-inset-bottom));
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        max-width: calc(100vw - 36px);
+        padding: 12px 16px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.64);
+        backdrop-filter: blur(12px);
+        font-size: 16px;
+        line-height: 1.2;
+        transition: opacity 180ms ease;
+    }
+    #status[data-state="connected"] { opacity: 0.72; }
+    #status.error { border: 1px solid rgba(255, 92, 92, 0.8); border-radius: 14px; }
+    .indicator { width: 11px; height: 11px; flex: 0 0 auto; border-radius: 50%; background: #8a8f98; }
+    #status[data-state="connecting"] .indicator { background: #f8c451; animation: pulse 1s infinite; }
+    #status[data-state="connected"] .indicator { background: #39d98a; }
+    #status[data-state="disconnected"] .indicator,
+    #status[data-state="error"] .indicator { background: #ff5c5c; }
+    #controls {
+        position: absolute;
+        right: max(18px, env(safe-area-inset-right));
+        bottom: max(18px, env(safe-area-inset-bottom));
+        display: flex;
+        gap: 12px;
+        pointer-events: auto;
+    }
+    button {
+        min-width: 154px;
+        min-height: 58px;
+        padding: 14px 22px;
+        border: 1px solid rgba(255, 255, 255, 0.3);
+        border-radius: 14px;
+        background: rgba(23, 28, 36, 0.86);
+        color: #fff;
+        font-size: 19px;
+        font-weight: 600;
+        cursor: pointer;
+        backdrop-filter: blur(12px);
+    }
+    button:hover, button:focus-visible { background: rgba(53, 93, 160, 0.94); outline: none; }
+    button:disabled { cursor: wait; opacity: 0.56; }
+    #stop { display: none; }
+    @keyframes pulse { 50% { opacity: 0.35; } }
+    @media (max-width: 700px) {
+        #controls { left: max(18px, env(safe-area-inset-left)); right: auto; bottom: max(80px, calc(env(safe-area-inset-bottom) + 62px)); }
+        button { min-width: 0; min-height: 54px; font-size: 17px; }
+        #status { right: max(18px, env(safe-area-inset-right)); font-size: 14px; }
+    }
+    </style>
+</head>
+<body>
+    <div id="media">
+        <video id="video" autoplay playsinline muted aria-label="Camera stream"></video>
+    </div>
+    <div id="overlay">
+        <div id="status" data-state="idle" role="status" aria-live="polite">
+            <span class="indicator"></span>
+            <span id="status-text">Camera not connected</span>
+        </div>
+        <div id="controls">
+            <button id="start" type="button">Start Camera</button>
+            <button id="stop" type="button">Stop Camera</button>
+        </div>
+    </div>
+    <script src="client.js"></script>
+</body>
+</html>
+"""
+
+FULLSCREEN_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Camera Fullscreen</title>
+    <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    body { font-family: Arial, Helvetica, sans-serif; color: #fff; }
+    #video {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #000;
+    }
+    #overlay {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 10;
+    }
+    #status {
+        position: absolute;
+        left: max(14px, env(safe-area-inset-left));
+        top: max(14px, env(safe-area-inset-top));
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        max-width: calc(100vw - 28px);
+        padding: 8px 14px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.65);
+        backdrop-filter: blur(10px);
+        font-size: 13px;
+        line-height: 1.2;
+        opacity: 0.8;
+        transition: opacity 300ms ease;
+    }
+    #status[data-state="connected"] { opacity: 0.75; }
+    #status.error { border: 1px solid rgba(255, 92, 92, 0.7); border-radius: 14px; }
+    .indicator { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: #8a8f98; }
+    #status[data-state="connecting"] .indicator { background: #f8c451; animation: pulse 1s infinite; }
+    #status[data-state="connected"] .indicator { background: #39d98a; }
+    #status[data-state="disconnected"] .indicator,
+    #status[data-state="error"] .indicator { background: #ff5c5c; }
+    #controls {
+        position: absolute;
+        right: max(14px, env(safe-area-inset-right));
+        bottom: max(14px, env(safe-area-inset-bottom));
+        display: flex;
+        gap: 10px;
+        pointer-events: auto;
+    }
+    button {
+        min-width: 120px;
+        min-height: 44px;
+        padding: 10px 18px;
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        border-radius: 12px;
+        background: rgba(23, 28, 36, 0.85);
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+        backdrop-filter: blur(10px);
+    }
+    button:hover, button:focus-visible { background: rgba(53, 93, 160, 0.9); outline: none; }
+    button:disabled { cursor: wait; opacity: 0.5; }
+    @keyframes pulse { 50% { opacity: 0.35; } }
+    @media (max-width: 600px) {
+        #controls { left: max(14px, env(safe-area-inset-left)); right: auto; bottom: max(70px, calc(env(safe-area-inset-bottom) + 50px)); }
+        button { min-width: 0; min-height: 40px; font-size: 13px; padding: 8px 14px; }
+        #status { font-size: 11px; padding: 6px 10px; }
+    }
+    </style>
+</head>
+<body>
+    <video id="video" autoplay playsinline muted aria-label="Camera stream"></video>
+    <div id="overlay">
+        <div id="status" data-state="idle" role="status" aria-live="polite">
+            <span class="indicator"></span>
+            <span id="status-text">Camera not connected</span>
+        </div>
+        <div id="controls">
+            <button id="start" type="button">Start Camera</button>
+            <button id="stop" type="button" style="display:none;">Stop Camera</button>
+        </div>
+    </div>
+    <script src="/client.js"></script>
+</body>
+</html>
+"""
+
+CLIENT_JS = """
+let pc = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let shouldReconnect = false;
+const maxReconnectAttempts = 3;
+
+const video = document.getElementById('video');
+const startButton = document.getElementById('start');
+const stopButton = document.getElementById('stop');
+const status = document.getElementById('status');
+const statusText = document.getElementById('status-text');
+
+function setStatus(state, text, isError = false) {
+    status.dataset.state = state;
+    status.classList.toggle('error', isError);
+    statusText.textContent = text;
+    if (state === 'error') {
+        startButton.textContent = 'Reconnect Camera';
+    } else if (state === 'idle') {
+        startButton.textContent = 'Start Camera';
+    }
+}
+
+function setControls(connecting) {
+    startButton.style.display = pc ? 'none' : 'inline-block';
+    stopButton.style.display = pc ? 'inline-block' : 'none';
+    startButton.disabled = connecting;
+}
+
+function waitForIceGatheringComplete(connection) {
+    if (connection.iceGatheringState === 'complete') {
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+        const checkState = () => {
+            if (connection.iceGatheringState === 'complete') {
+                connection.removeEventListener('icegatheringstatechange', checkState);
+                resolve();
+            }
+        };
+        connection.addEventListener('icegatheringstatechange', checkState);
+    });
+}
+
+function clearReconnectTimer() {
+    if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+}
+
+function closeConnection() {
+    if (!pc) {
+        return;
+    }
+    pc.onconnectionstatechange = null;
+    pc.close();
+    pc = null;
+    video.srcObject = null;
+}
+
+function scheduleReconnect() {
+    if (!shouldReconnect || reconnectTimer || reconnectAttempts >= maxReconnectAttempts) {
+        if (reconnectAttempts >= maxReconnectAttempts) {
+            setStatus('error', 'Camera disconnected. Select Reconnect Camera to try again.', true);
+            setControls(false);
+        }
+        return;
+    }
+
+    const delayMs = 1000 * (2 ** reconnectAttempts);
+    reconnectAttempts += 1;
+    setStatus('connecting', `Camera disconnected. Reconnecting (${reconnectAttempts}/${maxReconnectAttempts})...`);
+    reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        closeConnection();
+        startCamera();
+    }, delayMs);
+}
+
+async function startCamera() {
+    clearReconnectTimer();
+    closeConnection();
+    shouldReconnect = true;
+    setStatus('connecting', 'Preparing camera connection...');
+    startButton.disabled = true;
+
+    const connection = new RTCPeerConnection({ sdpSemantics: 'unified-plan' });
+    pc = connection;
+    setControls(true);
+    connection.addTransceiver('video', { direction: 'recvonly' });
+
+    connection.addEventListener('track', (event) => {
+        if (event.track.kind !== 'video') {
+            return;
+        }
+        video.srcObject = event.streams[0];
+        video.play().catch(() => {});
+        applyLowLatencyPlayout();
+    });
+
+    connection.addEventListener('connectionstatechange', () => {
+        applyLowLatencyPlayout();
+        if (connection !== pc) {
+            return;
+        }
+        if (connection.connectionState === 'connected') {
+            reconnectAttempts = 0;
+            setStatus('connected', 'Camera connected');
+            startButton.disabled = false;
+        } else if (connection.connectionState === 'failed' || connection.connectionState === 'disconnected') {
+            scheduleReconnect();
+        }
+    });
+
+    try {
+        const offer = await connection.createOffer();
+        await connection.setLocalDescription(offer);
+        await waitForIceGatheringComplete(connection);
+
+        const response = await fetch('/offer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sdp: connection.localDescription.sdp,
+                type: connection.localDescription.type,
+            }),
+        });
+        if (!response.ok) {
+            throw new Error(`Signaling request failed (${response.status})`);
+        }
+        await connection.setRemoteDescription(await response.json());
+        setStatus('connecting', 'Connecting to camera...');
+    } catch (error) {
+        if (connection !== pc) {
+            return;
+        }
+        closeConnection();
+        setStatus('error', `Camera connection failed: ${error.message}`, true);
+        startButton.disabled = false;
+        setControls(false);
+        scheduleReconnect();
+    }
+}
+
+function stopCamera() {
+    shouldReconnect = false;
+    reconnectAttempts = 0;
+    clearReconnectTimer();
+    closeConnection();
+    setStatus('idle', 'Camera stopped');
+    setControls(false);
+}
+
+startButton.addEventListener('click', () => {
+    reconnectAttempts = 0;
+    startCamera();
+});
+stopButton.addEventListener('click', stopCamera);
+window.addEventListener('beforeunload', stopCamera);
+
+function applyLowLatencyPlayout() {
+    if (!pc) {
+        return;
+    }
+    pc.getReceivers().forEach((receiver) => {
+        if (receiver.playoutDelayHint !== undefined) {
+            receiver.playoutDelayHint = 0;
+        }
+    });
+}
+"""
+
+# ========================================================
+# WebRTC publish
+# ========================================================
+class BGRArrayVideoStreamTrack(MediaStreamTrack):
+    """MediaStreamTrack exposing BGR ndarrays as av.VideoFrame (latest-frame semantics)."""
+    kind = "video"
+
+    def __init__(self):
+        super().__init__()
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._start_time = None
+        self._pts = 0
+
+    async def recv(self) -> av.VideoFrame:
+        # This will suspend execution until a frame is available
+        # preventing CPU busy-waiting
+        frame = await self._queue.get()
+        return frame
+
+    def push_frame(self, bgr_numpy: np.ndarray, loop: Optional[asyncio.AbstractEventLoop] = None):
+        if bgr_numpy is None:
+            return
+
+        # 1. Convert and calculate PTS immediately
+        # MediaRelay requires consistent PTS to function correctly
+        try:
+            video_frame = av.VideoFrame.from_ndarray(bgr_numpy, format="bgr24")
+            # Leave colorspace/range unset. The source is already converted
+            # to 8-bit BGR and the PICO WebGL path interprets explicit MPEG
+            # range metadata as a second limited-range conversion, producing
+            # a washed-out image. The standalone browser view confirms the
+            # raw BGR -> WebRTC conversion is otherwise correct.
+            
+            if self._start_time is None:
+                self._start_time = time.time()
+                self._pts = 0
+            else:
+                # 90000 is the standard RTP clock rate for video
+                # This ensures smooth playback
+                self._pts = int((time.time() - self._start_time) * 90000)
+            
+            video_frame.pts = self._pts
+            video_frame.time_base = fractions.Fraction(1, 90000)
+            
+        except Exception as e:
+            logger_mp.debug(f"Conversion failed: {e}")
+            return
+
+        # 2. Push to queue thread-safely
+        target_loop = loop or asyncio.get_event_loop()
+        if target_loop.is_closed():
+            return
+            
+        def _put():
+            try:
+                # Drop old frame if queue is full (Low Latency strategy)
+                if self._queue.full():
+                    self._queue.get_nowait()
+                self._queue.put_nowait(video_frame)
+            except Exception:
+                pass
+
+        target_loop.call_soon_threadsafe(_put)
+
+
+class WebRTC_PublisherThread(threading.Thread):
+    """
+    Runs aiohttp + aiortc in a separate THREAD (not Process).
+    This enables shared memory and removes Pickling overhead.
+    """
+    def __init__(self, port: int, host: str = "0.0.0.0", codec_pref: str = None):
+        super().__init__(daemon=True)
+        self._host = host
+        self._port = port
+        self._codec_pref = codec_pref
+        self._app = web.Application()
+        self._runner: Optional[web.AppRunner] = None
+        self._pcs = set()
+        self._start_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._frame_queue = queue.Queue(maxsize=1)
+
+        self._bgr_track: Optional[BGRArrayVideoStreamTrack] = None
+        self._relay: Optional[MediaRelay] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # register routes
+        self._app.router.add_get("/", self._index)
+        self._app.router.add_get("/fullscreen", self._fullscreen)
+        self._app.router.add_get("/client.js", self._javascript)
+        self._app.router.add_post("/offer", self._offer)
+        # 机器人状态（原 8013 的 /status、/health，合并到这里）
+        self._app.router.add_get("/status", self._status)
+        self._app.router.add_get("/health", self._health)
+
+        self._app.router.add_options("/", self._options)
+        self._app.router.add_options("/fullscreen", self._options)
+        self._app.router.add_options("/client.js", self._options)
+        self._app.router.add_options("/offer", self._options)
+        self._app.router.add_options("/status", self._options)
+        self._app.router.add_options("/health", self._options)
+
+    async def _status(self, request: web.Request) -> web.Response:
+        """机器人状态：BMS 电量、系统信息、常驻服务状态。
+
+        system_status() 内部会调 subprocess 查 systemctl，同步执行会阻塞事件循环，
+        因此丢到默认线程池里跑。
+
+        必须带 CORS 头：控制台页面跑在另一个 origin（localhost:5174 或公网域名），
+        fetch 这里是跨域请求。iframe 画面不受同源策略限制，但 fetch 会 ——
+        少了 Access-Control-Allow-Origin，浏览器直接拦掉响应，前端表现为
+        "机器人状态不可达"，而不是拿到数据。
+        """
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(None, _bms_system_status)
+        return web.json_response(
+            payload,
+            dumps=functools.partial(json.dumps, ensure_ascii=False),
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    async def _health(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            {"ok": True, "ts": int(time.time() * 1000)},
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    async def _index(self, request: web.Request) -> web.Response:
+        return web.Response(content_type="text/html", text=INDEX_HTML)
+
+    async def _fullscreen(self, request: web.Request) -> web.Response:
+        return web.Response(content_type="text/html", text=FULLSCREEN_HTML)
+
+    async def _javascript(self, request: web.Request) -> web.Response:
+        return web.Response(content_type="application/javascript", text=CLIENT_JS)
+
+    async def _options(self, request):
+        return web.Response(
+            status=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            }
+        )
+
+    async def _offer(self, request: web.Request) -> web.Response:
+        params = await request.json()
+        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+        pc = RTCPeerConnection()
+        self._pcs.add(pc)
+
+        # CORE LOGIC: Use MediaRelay to subscribe
+        # This ensures encoding happens only once globally
+        if self._bgr_track and self._relay:
+            try:
+                # Do not let a slow encoder or client build a FIFO of stale
+                # frames. Real-time viewing must prefer the newest frame.
+                relayed_track = self._relay.subscribe(self._bgr_track, buffered=False)
+                transceiver = pc.addTransceiver(relayed_track, direction="sendonly")
+                capabilities = RTCRtpSender.getCapabilities("video")
+                pref = (self._codec_pref or "h264").lower()
+
+                if pref == "h264":
+                    h264_codecs = [c for c in capabilities.codecs if c.mimeType == "video/H264"]
+                    if h264_codecs:
+                        transceiver.setCodecPreferences(h264_codecs)
+                        logger_mp.info(f"[WebRTC] Preferred H264 for port:{self._port}")
+                    else:
+                        logger_mp.warning(f"[WebRTC] H264 preferred but not found, using auto-negotiation for port:{self._port}")
+                        
+                elif pref == "vp8":
+                    vp8_codecs = [c for c in capabilities.codecs if c.mimeType == "video/VP8"]
+                    if vp8_codecs:
+                        transceiver.setCodecPreferences(vp8_codecs)
+                        logger_mp.info(f"[WebRTC] Preferred VP8 for port:{self._port}")
+                    else:
+                        logger_mp.warning(f"[WebRTC] VP8 preferred but not found, using auto-negotiation for port:{self._port}")
+                
+                else:
+                    h264_codecs = [c for c in capabilities.codecs if c.mimeType == "video/H264"]
+                    if h264_codecs:
+                        transceiver.setCodecPreferences(h264_codecs)
+                        logger_mp.info(f"[WebRTC] Preferred codec '{pref}' not found, falling back to H264 for port:{self._port}")
+                    else:
+                        logger_mp.warning(f"[WebRTC] Preferred codec '{pref}' not found, using auto-negotiation for port:{self._port}")
+                    
+            except Exception as e:
+                logger_mp.error(f"Relay subscription failed: {e}")
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            if pc.connectionState in ["failed", "closed"]:
+                await self._cleanup_pc(pc)
+
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}),
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            }
+        )
+
+    async def _cleanup_pc(self, pc):
+        self._pcs.discard(pc)
+        try:
+            await pc.close()
+        except: pass
+
+    def wait_for_start(self, timeout=1.0):
+        return self._start_event.wait(timeout=timeout)
+
+    def run(self):
+        # Create a new Event Loop for this thread
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        
+        async def _main():
+            self._runner = web.AppRunner(self._app)
+            await self._runner.setup()
+            
+            # Init Track and Relay inside the loop
+            self._bgr_track = BGRArrayVideoStreamTrack()
+            self._relay = MediaRelay()
+
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(CERT_PEM_PATH, KEY_PEM_PATH)
+            site = web.TCPSite(self._runner, self._host, self._port, ssl_context=ssl_context)
+            await site.start()
+            self._start_event.set()
+
+            # 状态采集与 60001 同进程（原 8013 已删除）。ensure_worker 幂等，
+            # 多端口 publisher 也只会初始化一次 DDS。
+            try:
+                _ensure_bms_worker()
+            except Exception as e:
+                logger_mp.error(f"BMS worker start failed: {e}")
+            
+            # Frame Pushing Loop
+            while not self._stop_event.is_set():
+                try:
+                    # Non-blocking check for new frames
+                    if not self._frame_queue.empty():
+                        # Get frame (no pickling overhead in Threads!)
+                        frame = self._frame_queue.get_nowait()
+                        self._bgr_track.push_frame(frame, loop=self._loop)
+                    
+                    # CRITICAL: Yield control to asyncio loop to handle WebRTC packets
+                    await asyncio.sleep(0.005)
+                except Exception:
+                    await asyncio.sleep(0.005)
+
+        try:
+            self._loop.run_until_complete(_main())
+        except Exception as e:
+            logger_mp.error(f"WebRTC Thread Error: {e}")
+        finally:
+            if self._loop: self._loop.close()
+
+    def send(self, data: np.ndarray):
+        """Send data to the processing thread."""
+        # Simple drop-frame logic if queue is full
+        if not self._frame_queue.full():
+            self._frame_queue.put(data)
+        else:
+            try:
+                self._frame_queue.get_nowait()
+                self._frame_queue.put(data)
+            except: pass
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=1.0)
+
+
+# ========================================================
+# WebRTC Manager
+# ========================================================
+class WebRTC_PublisherManager:
+    """Manages WebRTC_PublisherThreads."""
+    _instance: Optional["WebRTC_PublisherManager"] = None
+    _publisher_threads: Dict[Tuple[str, int], WebRTC_PublisherThread] = {}
+    _lock = threading.Lock()
+    _running = True
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def get_instance(cls) -> "WebRTC_PublisherManager":
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def _create_publisher(self, port: int, host: str, codec_pref: str):
+        t = WebRTC_PublisherThread(port, host, codec_pref)
+        t.start()
+        if not t.wait_for_start(timeout=10.0):  # Increase timeout to 10 seconds
+             raise ConnectionError("Publisher failed to start (Timeout)")
+        return t
+
+    def _get_publisher(self, port, host, codec_pref):
+        key = (host, port)
+        with self._lock:
+            if key not in self._publisher_threads:
+                self._publisher_threads[key] = self._create_publisher(port, host, codec_pref)
+            return self._publisher_threads[key]
+
+    def publish(self, data: Any, port: int, host: str = "0.0.0.0", codec_pref: str = None) -> None:
+        if not self._running: return
+        try:
+            pub = self._get_publisher(port, host, codec_pref)
+            pub.send(data)
+        except Exception as e:
+            logger_mp.error(f"Unexpected error in publish: {e}")
+            pass
+
+    def close(self) -> None:
+        self._running = False
+        with self._lock:
+            for key, pub in list(self._publisher_threads.items()):
+                try:
+                    pub.stop()
+                except Exception: pass
+            self._publisher_threads.clear()
+
+# ========================================================
+# UVC driver reload
+# ========================================================
+def reload_uvc_driver():
+    try:
+        subprocess.run("sudo modprobe -r uvcvideo", shell=True, check=True)
+        time.sleep(1)
+        subprocess.run("sudo modprobe uvcvideo debug=0", shell=True, check=True)
+        time.sleep(1)
+        logger_mp.info("UVC driver reloaded successfully.")
+    except subprocess.CalledProcessError as e:
+        logger_mp.error(f"Failed to reload driver: {e}")
+
+# ========================================================
+# camera finder and cameras
+# ========================================================
+class CameraFinder:
+    """
+    Discover connected cameras and their properties.
+    vpath: /dev/videoX
+    ppath: physical path in /sys/class/video4linux, e.g. /sys/devices/pci0000:00/0000:00:14.0/usb1/1-11/1-11.2/1-11.2:1.0
+    uid: USB unique ID, e.g. "001:002"
+    dev_info: extra info from uvc
+    sn: serial number of the camera
+    """
+    def __init__(self, realsense_enable=False, verbose=False):
+        self.verbose = verbose
+        # uvc
+        # The launcher performs any required UVC reload and camera mode setup.
+        # Reloading here would reset the negotiated V4L2 format immediately
+        # before OpenCV opens the configured device.
+        import uvc
+        self.uvc_devices = uvc.device_list()
+        self.uid_map = {dev["uid"]: dev for dev in self.uvc_devices}
+        # all video devices
+        self.video_paths = self._list_video_paths()
+        # realsense
+        if realsense_enable:
+            self.rs_serial_numbers = self._list_realsense_serial_numbers()
+            self.rs_video_paths = self._list_realsense_video_paths()
+            self.rs_rgb_video_paths = [p for p in self.rs_video_paths if self._is_like_rgb(p)]
+        else:
+            self.rs_serial_numbers = []
+            self.rs_video_paths = []
+            self.rs_rgb_video_paths = []
+        # rgb & uvc
+        self.uvc_rgb_video_paths = self._list_uvc_rgb_video_paths()
+        self.uvc_rgb_video_ids = [int(v.replace("/dev/video", "")) for v in self.uvc_rgb_video_paths]
+        self.uvc_rgb_physical_paths = [self._get_ppath_from_vpath(v) for v in self.uvc_rgb_video_paths]
+        self.uvc_rgb_uids = [self._get_uid_from_ppath(p) for p in self.uvc_rgb_physical_paths]
+        self.uvc_rgb_dev_info = [self.uid_map.get(uid) for uid in self.uvc_rgb_uids]
+        self.uvc_rgb_serial_numbers = [dev_info.get("serialNumber") if dev_info else None for dev_info in self.uvc_rgb_dev_info]
+        # all uvc cameras
+        self.uvc_rgb_cameras = {}
+        for vpath, vid, ppath, uid, dev_info, sn in zip(
+            self.uvc_rgb_video_paths,
+            self.uvc_rgb_video_ids,
+            self.uvc_rgb_physical_paths,
+            self.uvc_rgb_uids,
+            self.uvc_rgb_dev_info,
+            self.uvc_rgb_serial_numbers,
+        ):
+            self.uvc_rgb_cameras[vpath] = {
+                "video_id": vid,
+                "physical_path": ppath,
+                "uid": uid,
+                "dev_info": dev_info,
+                "serial_number": sn
+            }
+        if self.verbose:
+            self.info()
+
+    # utils
+    def _list_video_paths(self):
+        base = "/sys/class/video4linux/"
+        if not os.path.exists(base):
+            return []
+        return [f"/dev/{x}" for x in sorted(os.listdir(base)) if x.startswith("video")]
+
+    def _list_uvc_rgb_video_paths(self):
+        return [p for p in self.video_paths if self._is_like_rgb(p) and p not in self.rs_video_paths]
+
+    def _list_realsense_video_paths(self):
+        def _read_text(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read().strip()
+            except Exception:
+                return None
+
+        def _parent_usb_device_sysdir(video_sysdir):
+            d = os.path.realpath(os.path.join(video_sysdir, "device"))
+            for _ in range(10):
+                if d is None or d == "/" or not os.path.isdir(d):
+                    break
+                id_vendor = _read_text(os.path.join(d, "idVendor"))
+                id_product = _read_text(os.path.join(d, "idProduct"))
+                if id_vendor and id_product:
+                    return d
+                d_next = os.path.dirname(d)
+                if d_next == d:
+                    break
+                d = d_next
+            return None
+
+        ports = []
+        for devnode in sorted(glob.glob("/dev/video*")):
+            sysdir = f"/sys/class/video4linux/{os.path.basename(devnode)}"
+            name = _read_text(os.path.join(sysdir, "name"))
+            usb_dir = _parent_usb_device_sysdir(sysdir)
+            vendor_id = _read_text(os.path.join(usb_dir, "idVendor")) if usb_dir else None
+
+            # Match RealSense by name and Intel vendor ID
+            if name and "realsense" in name.lower() and (vendor_id or "").lower() in ("8086", "32902"):
+                ports.append(devnode)
+
+        return ports
+    
+    def get_realsense_module(self) -> object:
+        try:
+            import pyrealsense2 as rs
+            return rs
+        except ImportError:
+            arch = platform.machine()
+            system = platform.system()
+            print(f"[RealSense] Platform: {system} / {arch}")
+
+            if system == "Linux" and arch.startswith("aarch64"):
+                # Jetson NX / arm64
+                msg = (
+                    "[RealSense] pyrealsense2 not installed. please build from source:\n"
+                    "    cd ~\n"
+                    "    git clone https://github.com/IntelRealSense/librealsense.git\n"
+                    "    cd librealsense\n"
+                    "    git checkout v2.50.0\n"
+                    "    mkdir build && cd build\n"
+                    "    cmake .. -DBUILD_PYTHON_BINDINGS=ON -DPYTHON_EXECUTABLE=$(which python3)\n"
+                    "    make -j$(nproc)\n"
+                    "    sudo make install\n"
+                )
+            else:
+                # x86/x64
+                msg = (
+                    "[RealSense] pyrealsense2 not installed. You can try:\n"
+                    "    pip install pyrealsense2\n"
+                )
+            raise RuntimeError(msg)
+
+    def _list_realsense_serial_numbers(self):
+        rs = self.get_realsense_module()
+        ctx = rs.context()
+        devices = ctx.query_devices()
+        serials = []
+        for dev in devices:
+            try:
+                serials.append(dev.get_info(rs.camera_info.serial_number))
+            except Exception:
+                continue
+        return serials
+
+    def _get_ppath_from_vpath(self, video_path):
+        sysfs_path = f"/sys/class/video4linux/{os.path.basename(video_path)}/device"
+        return os.path.realpath(sysfs_path)
+
+    def _get_uid_from_ppath(self, physical_path):
+        def read_file(path):
+            return open(path).read().strip() if os.path.exists(path) else None
+
+        busnum_file = os.path.join(physical_path, "busnum")
+        devnum_file = os.path.join(physical_path, "devnum")
+
+        if not (os.path.exists(busnum_file) and os.path.exists(devnum_file)):
+            parent = os.path.dirname(physical_path)
+            busnum_file = os.path.join(parent, "busnum")
+            devnum_file = os.path.join(parent, "devnum")
+
+        if os.path.exists(busnum_file) and os.path.exists(devnum_file):
+            bus = read_file(busnum_file)
+            dev = read_file(devnum_file)
+            return f"{bus}:{dev}"
+        return None
+
+    def _is_like_rgb(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return False
+        ret, frame = cap.read()
+        cap.release()
+        return ret and frame is not None and frame.ndim == 3 and frame.shape[2] == 3
+
+    # --------------------------------------------------------
+    # public api
+    # --------------------------------------------------------
+    def is_rs_serial_exist(self, serial_number):
+        if serial_number is None and len(self.rs_serial_numbers) > 0:
+            return True
+        return str(serial_number) in self.rs_serial_numbers
+
+    def is_vpath_exist(self, vpath):
+        return vpath in self.video_paths
+    
+    def is_ppath_exist(self, physical_path):
+        for cam in self.uvc_rgb_cameras.values():
+            if cam.get("physical_path") == physical_path:
+                return True
+        return False
+    
+    def get_uid_by_sn(self, serial_number):
+        matches = [
+            cam for cam in self.uvc_rgb_cameras.values()
+            if cam.get("serial_number") == str(serial_number)
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError(f"Multiple cameras found with serial number {serial_number}")
+        return matches[0].get("uid")
+
+    def get_uid_by_ppath(self, physical_path):
+        for cam in self.uvc_rgb_cameras.values():
+            if cam.get("physical_path") == physical_path:
+                return cam.get("uid")
+        return None
+    
+    def get_uid_by_vpath(self, video_path):
+        cam = self.uvc_rgb_cameras.get(video_path)
+        if cam:
+            return cam.get("uid")
+        return None
+    
+    def get_vpath_by_sn(self, serial_number):
+        matches = []
+        for cam in self.uvc_rgb_cameras.values():
+            if cam.get("serial_number") == str(serial_number):
+                vpath = f"/dev/video{cam.get('video_id')}"
+                matches.append(vpath)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError(f"Multiple video devices found for serial number {serial_number}: {matches}. ")
+        return matches[0]
+
+    def get_vpath_by_ppath(self, physical_path):
+        base = "/sys/class/video4linux/"
+        matches = []
+        for v in os.listdir(base):
+            sys_path = os.path.realpath(os.path.join(base, v, "device"))
+            if sys_path == physical_path:
+                vpath = f"/dev/{v}"
+                if self._is_like_rgb(vpath):
+                    matches.append(vpath)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError(f"Multiple video devices found for physical path {physical_path}: {matches}. ")
+        return matches[0]
+    
+
+    def info(self):
+        logger_mp.info("======================= Camera Discovery Start ==================================")
+        logger_mp.info("Found video devices: %s", self.video_paths)
+        logger_mp.info("Found RGB video devices: %s", self.uvc_rgb_video_paths)
+
+        if self.rs_serial_numbers:
+            logger_mp.info("----------------------- Realsense Cameras ----------------------------------")
+            logger_mp.info(f"RealSense serial numbers: {self.rs_serial_numbers}")
+            logger_mp.info(f"RealSense video paths: {self.rs_video_paths}")
+            logger_mp.info(f"RealSense RGB-like video paths: {self.rs_rgb_video_paths}")
+
+        for idx, (vpath, cam) in enumerate(self.uvc_rgb_cameras.items(), start=1):
+            logger_mp.info("----------------------- OpenCV / UVC Camera %d -----------------------------", idx)
+            logger_mp.info("video_path    : %s", vpath)
+            logger_mp.info("video_id      : %s", cam.get("video_id"))
+            logger_mp.info("serial_number : %s", cam.get("serial_number") or "unknown")
+            logger_mp.info("physical_path : %s", cam.get("physical_path"))
+            logger_mp.info("extra_info:")
+
+            dev_info = cam.get("dev_info")
+            uid = cam.get("uid")
+
+            if dev_info:
+                for k, v in dev_info.items():
+                    logger_mp.info("    %s: %s", k, v)
+                try:
+                    import uvc
+                    cap = uvc.Capture(uid)
+                    for fmt in cap.available_modes:
+                        logger_mp.info("    format: %dx%d@%d %s", fmt.height, fmt.width, fmt.fps, fmt.format_name)
+                    cap.close()
+                    cap = None
+                except Exception as e:
+                    logger_mp.warning("    failed to get formats: %s", e)
+            else:
+                logger_mp.info("    no uvc extra info available")
+
+        logger_mp.info("=========================== Camera Discovery End ================================")
+
+class BaseCamera:
+    def __init__(self, cam_topic, img_shape, fps, 
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
+        self._ready = threading.Event()
+        self._cam_topic = cam_topic
+        self._img_shape = img_shape # (H, W)
+        self._fps = fps
+        self._enable_zmq = enable_zmq
+        self._zmq_port = zmq_port
+        if self._enable_zmq:
+            self._zmq_buffer = TripleRingBuffer()
+        else:
+            self._zmq_buffer = None
+
+        self._enable_webrtc = enable_webrtc
+        self._webrtc_port = webrtc_port
+        self._webrtc_codec = webrtc_codec
+        if self._enable_webrtc:
+            self._webrtc_buffer = TripleRingBuffer()
+        else:
+            self._webrtc_buffer = None
+
+        # ---- 立体分屏（stereo_split_webrtc）相关属性：基类统一默认关闭 ----
+        # 基类的 get_bgr_frame() / get_bgr_frame_left() / get_bgr_frame_right() /
+        # get_webrtc_port() 会直接读取下面这几个字段。它们原先只在 OpenCVCamera.__init__
+        # 里赋值，于是 RealSenseCamera / UVCCamera 一调用 get_bgr_frame() 就抛
+        # AttributeError: 'RealSenseCamera' object has no attribute '_stereo_split_webrtc'；
+        # 该异常又被 _webrtc_pub() 的 except 吞掉（只记固定文案不记异常），
+        # 现场表现是 "[Image Server] Failed to publish rtc frame from xxx camera." 之后
+        # _stop_event.set() → 服务立即退出 → systemd 反复重启，极难定位。
+        # 这里在基类给全默认值；OpenCVCamera 会在自己的 __init__ 中按配置覆盖。
+        self._stereo_split_webrtc = False
+        self._webrtc_buffer_left = None
+        self._webrtc_buffer_right = None
+        self._webrtc_port_left = webrtc_port
+        self._webrtc_port_right = webrtc_port
+
+    def __str__(self):
+        raise NotImplementedError
+    
+    def __repr__(self):
+        return self.__str__()
+
+    def _update_frame(self):
+        """Return a jepg frame as bytes, and a bgr frame as numpy array"""
+        raise NotImplementedError
+    
+    def wait_until_ready(self, timeout=None):
+        """Block until the camera is ready (first frame is available) or timeout occurs."""
+        return self._ready.wait(timeout=timeout)
+
+    def enable_webrtc(self):
+        return self._enable_webrtc
+    
+    def enable_zmq(self):
+        return self._enable_zmq
+
+    def get_jpeg_bytes(self):
+        jpeg_bytes = self._zmq_buffer.read() if self._enable_zmq and self._zmq_buffer else None
+        return jpeg_bytes
+
+    def get_bgr_frame(self):
+        if self._stereo_split_webrtc:
+            return None
+        bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
+        return bgr_numpy
+
+    def get_bgr_frame_left(self):
+        if not self._stereo_split_webrtc or self._webrtc_buffer_left is None:
+            return None
+        return self._webrtc_buffer_left.read()
+
+    def get_bgr_frame_right(self):
+        if not self._stereo_split_webrtc or self._webrtc_buffer_right is None:
+            return None
+        return self._webrtc_buffer_right.read()
+
+    def get_depth_frame(self):
+        """Return a depth frame as bytes, or None if not supported. 
+           Before call this function, must first call get_frame() to update the latest depth data."""
+        return None
+
+    def get_zmq_port(self):
+        """Return the zmq port number the camera is serving on."""
+        return self._zmq_port
+    
+    def get_webrtc_port(self):
+        """Return the webrtc port number the camera is serving on."""
+        if self._stereo_split_webrtc:
+            return self._webrtc_port_left
+        return self._webrtc_port
+
+    def get_webrtc_port_left(self):
+        """Return the left-eye webrtc port when stereo_split_webrtc is enabled."""
+        return self._webrtc_port_left
+
+    def get_webrtc_port_right(self):
+        """Return the right-eye webrtc port when stereo_split_webrtc is enabled."""
+        return self._webrtc_port_right
+    
+    def get_webrtc_codec(self):
+        """Return the webrtc codec setting."""
+        return self._webrtc_codec
+
+    def get_fps(self):
+        """Return the camera FPS setting."""
+        return self._fps
+
+    def release(self):
+        """Release camera resources."""
+        raise NotImplementedError
+
+class RealSenseCamera(BaseCamera):
+    def __init__(self, cam_topic, serial_number, img_shape, fps, 
+                 enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, enable_depth=False):
+        rs = self.check_pyrealsense2_install()
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        self._serial_number = serial_number
+        self._enable_depth = enable_depth
+        self._latest_depth = None
+        try:
+            align_to = rs.stream.color
+            self.align = rs.align(align_to)
+            self.pipeline = rs.pipeline()
+            config = rs.config()
+            if self._serial_number is not None:
+                config.enable_device(self._serial_number)
+
+            config.enable_stream(rs.stream.color, self._img_shape[1], self._img_shape[0], rs.format.bgr8, self._fps)
+            if self._enable_depth:
+                config.enable_stream(rs.stream.depth, self._img_shape[1], self._img_shape[0], rs.format.z16, self._fps)
+
+            profile = self.pipeline.start(config)
+            self._device = profile.get_device()
+            if self._device is None:
+                logger_mp.error('[RealSenseCamera] pipe_profile.get_device() is None .')
+            if self._enable_depth:
+                assert self._device is not None
+                depth_sensor = self._device.first_depth_sensor()
+                self.g_depth_scale = depth_sensor.get_depth_scale()
+
+            self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            logger_mp.info(str(self))
+        except Exception as e:
+            if self.pipeline:
+                try:
+                    self.pipeline.stop()
+                except:
+                    pass
+            raise RuntimeError(f"[RealSenseCamera] Failed to initialize RealSense camera {self._serial_number}: {e}")
+
+    def __str__(self):
+        return (
+            f"[RealSenseCamera: {self._cam_topic}] initialized with "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
+            f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+
+    def check_pyrealsense2_install(self):
+        try:
+            import pyrealsense2 as rs
+            return rs
+        except Exception as e:
+            raise ImportError(
+                "pyrealsense2 not installed. Install Intel RealSense SDK and pyrealsense2 Python bindings."
+            ) from e
+    
+    def _update_frame(self):
+        frames = self.pipeline.wait_for_frames()
+        aligned_frames = self.align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        if not color_frame:
+            return None
+
+        if self._enable_depth:   
+            depth_frame = aligned_frames.get_depth_frame()
+            if depth_frame:
+                self._latest_depth = np.asanyarray(depth_frame.get_data())
+            else:
+                self._latest_depth = None
+
+        bgr_numpy = np.asanyarray(color_frame.get_data())
+
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(bgr_numpy)
+
+        if self._enable_zmq:
+            ok, buf = cv2.imencode(".jpg", bgr_numpy)
+            if ok:
+                self._zmq_buffer.write(buf.tobytes())
+        
+        if not self._ready.is_set():
+            self._ready.set()
+    
+    def get_depth_frame(self):
+        if self._latest_depth is None:
+            return None
+        return self._latest_depth.tobytes()
+
+    def release(self):
+        try:
+            if hasattr(self.pipeline, "stop") and getattr(self.pipeline, "_running", False):
+                try:
+                    self.pipeline.stop()
+                except Exception as e:
+                    logger_mp.warning(f"[RealSenseCamera] pipeline.stop() failed: {e}")
+        except Exception:
+            pass
+        self.pipeline = None
+        logger_mp.info(f"[RealSenseCamera] Released {self._cam_topic}")
+
+class UVCCamera(BaseCamera):
+    def __init__(self, cam_topic, uid, img_shape, fps, 
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        import uvc
+        self.uid = uid
+        self.cap = None
+        try:
+            self.cap = uvc.Capture(self.uid)
+        except Exception as e:
+            self.cap = None
+            raise RuntimeError(f"[UVCCamera] Failed to open camera {self._cam_topic}: {e}")
+
+        try:
+            self.cap.frame_mode = self._choose_mode(self.cap, width=self._img_shape[1], height=self._img_shape[0], fps=self._fps)
+            logger_mp.info(str(self))
+        except Exception as e:
+            self.cap = None
+            raise RuntimeError(f"[UVCCamera] Failed to set mode for {self._cam_topic}: {e}")
+
+    def __str__(self):
+        return (
+            f"[UVCCamera: {self._cam_topic}] initialized with "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS, MJPG.\n"
+            f"ZMQ: {'enabled, zmq port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+
+    def _choose_mode(self, cap, width=None, height=None, fps=None):
+        for m in cap.available_modes:
+            if m.width == width and m.height == height and m.fps == fps and m.format_name == "MJPG":
+                return m
+        raise ValueError("[UVCCamera] No matching uvc mode found")
+
+    def _update_frame(self):
+        if self.cap is not None:
+            frame = self.cap.get_frame_robust() # get_frame(timeout=500)
+            if frame is not None:
+                if self._enable_zmq:
+                    if frame.jpeg_buffer is not None:
+                        self._zmq_buffer.write(bytes(frame.jpeg_buffer))
+
+                if self._enable_webrtc:
+                    if frame.bgr is not None:
+                        self._webrtc_buffer.write(frame.bgr)
+
+                if not self._ready.is_set():
+                    self._ready.set()
+            else:
+                raise RuntimeError
+
+    def release(self):
+        # if usbhub is plugged out, calling stop_streaming and close may hang forever.
+        # try:
+        #     self.cap.stop_streaming()
+        # except Exception:
+        #     pass
+        # try:
+        #     self.cap.close()
+        # except Exception:
+        #     pass
+        # self.cap = None
+        logger_mp.info(f"[UVCCamera] Released {self._cam_topic}")
+
+class OpenCVCamera(BaseCamera):
+    def __init__(self, cam_topic, video_path, img_shape, fps, 
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
+                 capture_img_shape=None, stereo_fusion=False, stereo_crop_left=0, stereo_crop_right=0, stereo_blend_alpha=0.5,
+                 stereo_right_shift_x=0, stereo_sbs=False, stereo_shift_x=0,
+                 stereo_split_webrtc=False, webrtc_port_left=None, webrtc_port_right=None):
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        self._video_path = video_path
+        self._capture_img_shape = capture_img_shape or img_shape
+        self._stereo_fusion = stereo_fusion
+        self._stereo_crop_left = max(0, int(stereo_crop_left))
+        self._stereo_crop_right = max(0, int(stereo_crop_right))
+        self._stereo_blend_alpha = min(1.0, max(0.0, float(stereo_blend_alpha)))
+        self._stereo_right_shift_x = int(stereo_right_shift_x)
+        self._stereo_shift_x = int(stereo_shift_x)
+        self._stereo_sbs = bool(stereo_sbs)
+        self._stereo_split_webrtc = bool(stereo_split_webrtc)
+        self._webrtc_port_left = webrtc_port_left if webrtc_port_left is not None else webrtc_port
+        self._webrtc_port_right = webrtc_port_right if webrtc_port_right is not None else webrtc_port + 1
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._capture_stop = threading.Event()
+
+        if self._stereo_split_webrtc and self._enable_webrtc:
+            self._webrtc_buffer_left = TripleRingBuffer()
+            self._webrtc_buffer_right = TripleRingBuffer()
+        else:
+            self._webrtc_buffer_left = None
+            self._webrtc_buffer_right = None
+
+        self.cap = cv2.VideoCapture(self._video_path, cv2.CAP_V4L2)
+        # Keep only the newest V4L2 frame. A high-resolution stereo camera can
+        # otherwise accumulate stale frames while encoding, causing seconds of
+        # visible latency.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Do not force a pixel format here. The camera exposes different
+        # formats before/after the UVC driver reload; forcing an unsupported
+        # FOURCC makes OpenCV report a size but fail on the first read.
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._capture_img_shape[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._capture_img_shape[1])
+        self.cap.set(cv2.CAP_PROP_FPS, self._fps)
+
+        actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        logger_mp.info(
+            "[OpenCVCamera] %s requested %sx%s@%s, actual %sx%s@%.1f",
+            self._cam_topic, self._capture_img_shape[1], self._capture_img_shape[0],
+            self._fps, actual_width, actual_height, actual_fps,
+        )
+
+        # Test if the camera can read frames
+        if not self._can_read_frame():
+            self.release()
+            raise RuntimeError(f"[OpenCVCamera] Camera {self._cam_topic} failed to initialize or read frames.")
+        else:
+            self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self._capture_thread.start()
+            logger_mp.info(str(self))
+
+    def __str__(self):
+        return (
+            f"[OpenCVCamera: {self._cam_topic}] initialized with "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
+            f"ZMQ: {'enabled, zmq port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+        
+    def _can_read_frame(self):
+        success, frame = self.cap.read()
+        if success and frame is not None:
+            with self._frame_lock:
+                self._latest_frame = frame
+        return success
+
+    def _capture_loop(self):
+        """Continuously drain V4L2 and retain only the newest frame."""
+        while not self._capture_stop.is_set() and self.cap is not None:
+            ret, frame = self.cap.read()
+            if ret:
+                with self._frame_lock:
+                    self._latest_frame = frame
+            else:
+                logger_mp.warning("[OpenCVCamera] Failed to read a frame from %s", self._video_path)
+                time.sleep(0.001)
+    
+    def _update_frame(self):
+        if self.cap is not None:
+            with self._frame_lock:
+                bgr_numpy = self._latest_frame
+            if bgr_numpy is not None:
+                if self._stereo_sbs:
+                    bgr_numpy = self._crop_stereo_sbs_frame(bgr_numpy)
+                elif self._stereo_fusion:
+                    bgr_numpy = self._fuse_stereo_frame(bgr_numpy)
+
+                if self._stereo_shift_x and bgr_numpy is not None:
+                    transform = np.float32([[1, 0, self._stereo_shift_x], [0, 1, 0]])
+                    bgr_numpy = cv2.warpAffine(
+                        bgr_numpy,
+                        transform,
+                        (bgr_numpy.shape[1], bgr_numpy.shape[0]),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REPLICATE,
+                    )
+
+                if self._stereo_split_webrtc and bgr_numpy is not None:
+                    half_width = bgr_numpy.shape[1] // 2
+                    left_frame = bgr_numpy[:, :half_width]
+                    right_frame = bgr_numpy[:, half_width:]
+                    if self._stereo_right_shift_x:
+                        transform = np.float32([[1, 0, self._stereo_right_shift_x], [0, 1, 0]])
+                        right_frame = cv2.warpAffine(
+                            right_frame,
+                            transform,
+                            (right_frame.shape[1], right_frame.shape[0]),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_REPLICATE,
+                        )
+                    if self._enable_webrtc:
+                        if self._webrtc_buffer_left is not None:
+                            self._webrtc_buffer_left.write(left_frame)
+                        if self._webrtc_buffer_right is not None:
+                            self._webrtc_buffer_right.write(right_frame)
+                    if self._enable_zmq:
+                        ok, buf = cv2.imencode(".jpg", bgr_numpy)
+                        if ok:
+                            self._zmq_buffer.write(buf.tobytes())
+                else:
+                    if self._enable_webrtc:
+                        self._webrtc_buffer.write(bgr_numpy)
+
+                    if self._enable_zmq:
+                        ok, buf = cv2.imencode(".jpg", bgr_numpy)
+                        if ok:
+                            self._zmq_buffer.write(buf.tobytes())
+                
+                if not self._ready.is_set():
+                    self._ready.set()
+            else:
+                # A capture thread can briefly have no fresh frame during
+                # device startup. Do not stop the entire server for this
+                # transient condition; the readiness timeout will report a
+                # real persistent capture failure.
+                return
+
+    def _fuse_stereo_frame(self, frame):
+        """Remove the left-edge marker and blend the two stereo views."""
+        if frame.shape[1] <= self._stereo_crop_left:
+            logger_mp.warning("[OpenCVCamera] Stereo crop exceeds frame width; using raw frame.")
+            return frame
+
+        half_width = frame.shape[1] // 2
+        if half_width == 0:
+            return frame
+
+        left = frame[:, :half_width]
+        right = frame[:, half_width:]
+        if left.shape[1] <= self._stereo_crop_left:
+            logger_mp.warning("[OpenCVCamera] Stereo crop exceeds left view width; using raw frame.")
+            return frame
+        left = left[:, self._stereo_crop_left:]
+        if left.shape != right.shape:
+            right = cv2.resize(right, (left.shape[1], left.shape[0]), interpolation=cv2.INTER_LINEAR)
+        if self._stereo_right_shift_x:
+            transform = np.float32([[1, 0, self._stereo_right_shift_x], [0, 1, 0]])
+            right = cv2.warpAffine(
+                right,
+                transform,
+                (right.shape[1], right.shape[0]),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        return cv2.addWeighted(left, self._stereo_blend_alpha, right, 1.0 - self._stereo_blend_alpha, 0)
+
+    def _crop_stereo_sbs_frame(self, frame):
+        """Crop the marker and resize the Pico SBS frame to the configured size."""
+        h, w = frame.shape[:2]
+        crop_left = min(self._stereo_crop_left, w // 2)
+        crop_right = min(getattr(self, '_stereo_crop_right', 0), w // 2)
+
+        if crop_left > 0 or crop_right > 0:
+            frame = frame[:, crop_left:w - crop_right if crop_right > 0 else None]
+
+        half_width = frame.shape[1] // 2
+        if half_width <= self._stereo_crop_left:
+            logger_mp.warning("[OpenCVCamera] Stereo crop exceeds eye width; using raw frame.")
+            output = frame
+        else:
+            left = frame[:, :half_width]
+            right = frame[:, half_width:half_width * 2]
+            left = left[:, self._stereo_crop_left:]
+            right = right[:, self._stereo_crop_left:]
+            output = cv2.hconcat([left, right])
+
+        target_height, target_width = self._img_shape
+        if output.shape[0] != target_height or output.shape[1] != target_width:
+            output = cv2.resize(
+                output,
+                (target_width, target_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        return output
+
+    def release(self):
+        self._capture_stop.set()
+        capture_thread = getattr(self, "_capture_thread", None)
+        if capture_thread is not None and capture_thread.is_alive():
+            capture_thread.join(timeout=1.0)
+        self.cap.release()
+        self.cap = None
+        logger_mp.info(f"[OpenCVCamera] Released {self._cam_topic}")
+
+class IsaacSimCamera(BaseCamera):
+    def __init__(self, cam_topic, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
+                 image_source="head", binocular=False):
+        """
+        IsaacSim camera that reads from shared memory.
+
+        Args:
+            cam_topic: camera topic name
+            img_shape: image shape [height, width]
+            fps: frames per second
+            enable_zmq: enable ZMQ publishing
+            zmq_port: ZMQ port
+            enable_webrtc: enable WebRTC publishing
+            webrtc_port: WebRTC port
+            webrtc_codec: WebRTC codec preference
+            image_source: which image to read from shared memory ("head", "left", "right")
+            binocular: if True and image_source=="head", concatenate left+right for binocular vision
+        """
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        from tools.shared_memory_utils import MultiImageReader # https://github.com/unitreerobotics/unitree_sim_isaaclab/tree/main/tools
+        self.multi_image_reader = MultiImageReader()
+        self._image_source = image_source  # "head", "left", or "right"
+        self._binocular = binocular
+        # For IsaacSim cameras, set ready immediately since the camera object is initialized
+        # and will wait for shared memory data in _update_frame
+        self._ready.set()
+        logger_mp.info(str(self))
+
+    def __str__(self):
+        mode = "binocular" if self._binocular else "monocular"
+        return (
+            f"[IsaacSimCamera: {self._cam_topic}] initialized with "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS, source='{self._image_source}', mode='{mode}'.\n"
+            f"ZMQ: {'enabled, zmq port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+
+    def _update_frame(self):
+        # Get the image data based on source and binocular settings
+        frame_data = None
+        if self._binocular:
+            # For binocular cameras: concatenate left + right images
+            left_img = self.multi_image_reader.read_single_image('left')
+            right_img = self.multi_image_reader.read_single_image('right')
+            logger_mp.debug(f"[IsaacSimCamera] {self._cam_topic} - left: {left_img is not None}, right: {right_img is not None}")
+
+            if left_img is not None and right_img is not None:
+                frame_data = cv2.hconcat([left_img, right_img])
+                logger_mp.debug(f"[IsaacSimCamera] {self._cam_topic} - concatenated binocular frame: {frame_data.shape}")
+        else:
+            # For monocular cameras: use the specified source directly
+            frame_data = self.multi_image_reader.read_single_image(self._image_source)
+            if frame_data is None:
+                logger_mp.debug(f"[IsaacSimCamera] {self._cam_topic} - no data for source '{self._image_source}'")
+
+        # Publish the frame data only if we have valid data
+        if frame_data is not None:
+            # For ZMQ: encode to JPEG bytes
+            if self._enable_zmq:
+                ok, buf = cv2.imencode(".jpg", frame_data)
+                if ok:
+                    self._zmq_buffer.write(buf.tobytes())
+                else:
+                    logger_mp.warning(f"[IsaacSimCamera] Failed to encode to JPEG for {self._cam_topic}")
+
+            # For WebRTC: use BGR frames directly
+            if self._enable_webrtc:
+                self._webrtc_buffer.write(frame_data)
+            else:
+                logger_mp.warning(f"[IsaacSimCamera] Failed to encode to WebRTC for {self._cam_topic}")
+            if not self._ready.is_set():
+                self._ready.set()
+        else:
+            logger_mp.debug(f"[IsaacSimCamera] No data available for {self._cam_topic}, frame_data is None")
+        # If no data is available, just return silently and wait for next frame
+
+    def release(self):
+        if hasattr(self, 'multi_image_reader') and self.multi_image_reader is not None:
+            self.multi_image_reader.close()
+        self.multi_image_reader = None
+        logger_mp.info(f"[IsaacSimCamera] Released {self._cam_topic}")
+# ========================================================
+# image server
+# ========================================================
+class ImageServer:
+    def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False):
+        global _H264_ENCODE_BITRATE, _H264_FRAMERATE
+        self._cam_config = cam_config
+        self._realsense_enable = realsense_enable
+        self._isaacsim_enable = isaacsim_enable
+        self._stop_event = threading.Event()
+        # 每路相机的"连续无帧"计数：单帧 None 只告警，连续无帧才判定失效
+        self._no_frame_state: dict[str, dict] = {}
+        self._cameras: dict[str, BaseCamera] = {}
+        if not self._isaacsim_enable:
+            self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
+        self._responser = ZMQ_Responser(self._cam_config)
+        self._zmq_publisher_manager = ZMQ_PublisherManager.get_instance()
+        self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
+        self._publisher_threads = []  # keep references for graceful join
+
+        try:
+            # Load cameras from self.cam_config
+            for cam_topic, cam_cfg in self._cam_config.items():
+                if not cam_cfg.get("enable_zmq", False) and not cam_cfg.get("enable_webrtc", False):
+                    continue
+
+                enable_zmq = cam_cfg.get("enable_zmq", False)
+                zmq_port = cam_cfg.get("zmq_port", None)
+                enable_webrtc = cam_cfg.get("enable_webrtc", False)
+                webrtc_port = cam_cfg.get("webrtc_port", None)
+                webrtc_codec = cam_cfg.get("webrtc_codec", None)
+                # 可选:按相机覆盖 H264 编码码率(提高画质)
+                bitrate = cam_cfg.get("bitrate", None)
+                if bitrate:
+                    _H264_ENCODE_BITRATE = int(bitrate)
+                cam_type = cam_cfg.get("type", "uvc").lower()
+                if self._isaacsim_enable and cam_type!="isaacsim":
+                    cam_type = "isaacsim"
+                img_shape = cam_cfg.get("image_shape", None)
+                capture_img_shape = cam_cfg.get("capture_image_shape", img_shape)
+                fps = cam_cfg.get("fps", 30)
+                # 编码器帧率跟随采集 fps,保证码率按真实帧率分配
+                _H264_FRAMERATE = int(fps) if fps else 30
+                video_id = cam_cfg.get("video_id", "0")
+                video_path = f"/dev/video{video_id}" if video_id is not None else None
+                physical_path = str(cam_cfg.get("physical_path")) if cam_cfg.get("physical_path") else None
+                serial_number = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
+
+                if cam_type == "opencv":
+                    if physical_path is not None:
+                        vpath = self._cam_finder.get_vpath_by_ppath(physical_path)
+                        if vpath is None:
+                            self._cameras[cam_topic] = None
+                            logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with physical path {physical_path}")
+                        else:
+                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
+                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                    capture_img_shape=capture_img_shape,
+                                                                     stereo_fusion=cam_cfg.get("stereo_fusion", False),
+                                                                     stereo_crop_left=cam_cfg.get("stereo_crop_left", 0),
+                                                                     stereo_crop_right=cam_cfg.get("stereo_crop_right", 0),
+                                                                     stereo_blend_alpha=cam_cfg.get("stereo_blend_alpha", 0.5),
+                                                                     stereo_right_shift_x=cam_cfg.get("stereo_right_shift_x", 0),
+                                                                     stereo_sbs=cam_cfg.get("stereo_sbs", False),
+                                                                     stereo_shift_x=cam_cfg.get("stereo_shift_x", 0),
+                                                                     stereo_split_webrtc=cam_cfg.get("stereo_split_webrtc", False),
+                                                                     webrtc_port_left=cam_cfg.get("webrtc_port_left", None),
+                                                                     webrtc_port_right=cam_cfg.get("webrtc_port_right", None))
+                            continue
+
+                    if serial_number is not None:
+                        vpath = self._cam_finder.get_vpath_by_sn(serial_number)
+                        if vpath is None:
+                            self._cameras[cam_topic] = None
+                            logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with serial number {serial_number}")
+                        else:
+                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
+                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                    capture_img_shape=capture_img_shape,
+                                                                     stereo_fusion=cam_cfg.get("stereo_fusion", False),
+                                                                     stereo_crop_left=cam_cfg.get("stereo_crop_left", 0),
+                                                                     stereo_crop_right=cam_cfg.get("stereo_crop_right", 0),
+                                                                     stereo_blend_alpha=cam_cfg.get("stereo_blend_alpha", 0.5),
+                                                                     stereo_right_shift_x=cam_cfg.get("stereo_right_shift_x", 0),
+                                                                     stereo_sbs=cam_cfg.get("stereo_sbs", False),
+                                                                     stereo_shift_x=cam_cfg.get("stereo_shift_x", 0),
+                                                                     stereo_split_webrtc=cam_cfg.get("stereo_split_webrtc", False),
+                                                                     webrtc_port_left=cam_cfg.get("webrtc_port_left", None),
+                                                                     webrtc_port_right=cam_cfg.get("webrtc_port_right", None))
+                            # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
+                            # ——— even if no camera matches the given path/serial.
+                            continue
+                    
+                    if not self._cam_finder.is_vpath_exist(video_path):
+                        self._cameras[cam_topic] = None
+                        logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with video_id {video_id}")
+                    else:
+                        self._cameras[cam_topic] = OpenCVCamera(cam_topic, video_path, img_shape, fps,
+                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                capture_img_shape=capture_img_shape,
+                                                                 stereo_fusion=cam_cfg.get("stereo_fusion", False),
+                                                                 stereo_crop_left=cam_cfg.get("stereo_crop_left", 0),
+                                                                 stereo_crop_right=cam_cfg.get("stereo_crop_right", 0),
+                                                                 stereo_blend_alpha=cam_cfg.get("stereo_blend_alpha", 0.5),
+                                                                 stereo_right_shift_x=cam_cfg.get("stereo_right_shift_x", 0),
+                                                                 stereo_sbs=cam_cfg.get("stereo_sbs", False),
+                                                                 stereo_shift_x=cam_cfg.get("stereo_shift_x", 0),
+                                                                 stereo_split_webrtc=cam_cfg.get("stereo_split_webrtc", False),
+                                                                 webrtc_port_left=cam_cfg.get("webrtc_port_left", None),
+                                                                 webrtc_port_right=cam_cfg.get("webrtc_port_right", None))
+                        
+
+                elif cam_type == "realsense":
+                    if not self._realsense_enable:
+                        self._cameras[cam_topic] = None
+                        logger_mp.error(f"[Image Server] Please start image server with the '--rs' flag to support Realsense {cam_topic}.")
+                    elif not self._cam_finder.is_rs_serial_exist(serial_number):
+                        self._cameras[cam_topic] = None
+                        logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
+                    else:
+                        self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
+                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+
+                elif cam_type == "uvc":
+                    uid = None
+                    if physical_path is not None:
+                        uid = self._cam_finder.get_uid_by_ppath(physical_path)
+                        if uid is None:
+                            self._cameras[cam_topic] = None
+                            logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with physical path {physical_path}")
+                        else:
+                            self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps, 
+                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            continue
+
+                    if serial_number is not None:
+                        uid = self._cam_finder.get_uid_by_sn(serial_number)
+                        if uid is None:
+                            self._cameras[cam_topic] = None
+                            logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with serial number {serial_number}")
+                        else:
+                            self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps, 
+                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                        # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
+                        # ——— even if no camera matches the given path/serial.
+                        continue
+                elif cam_type == "isaacsim":
+                    # Check if binocular mode is enabled
+                    binocular = cam_cfg.get("binocular", False)
+
+                    # For IsaacSim cameras, determine image source based on camera topic and binocular setting
+                    if binocular:
+                        # Binocular cameras (like head) need to read left+right and concatenate
+                        image_source = "head"  # Special marker for binocular
+                    else:
+                        # Monocular cameras read their specific source
+                        if "left" in cam_topic.lower():
+                            image_source = "left"
+                        elif "right" in cam_topic.lower():
+                            image_source = "right"
+                        else:
+                            image_source = "head"  # fallback
+
+                    self._cameras[cam_topic] = IsaacSimCamera(cam_topic, img_shape, fps,
+                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                image_source=image_source, binocular=binocular)
+                elif cam_type == "scam":
+                    # --- SCAM SDK（锐尔威视 单路图像+IMU）：SBS 双目 + 11 组 IMU/帧 ---
+                    from .scam_camera import ScamCamera
+                    from .stabilizer import SbsStabilizer
+                    raw_library_path = cam_cfg.get("sdk_library_path", "")
+                    if raw_library_path:
+                        library_path = os.path.expandvars(raw_library_path)
+                        if not os.path.isabs(library_path):
+                            library_path = os.path.join(
+                                os.path.dirname(os.path.abspath(CONFIG_PATH)),
+                                library_path,
+                            )
+                    else:
+                        camera_sdk_dir = os.environ.get("CAMERA_SDK_DIR", "")
+                        if camera_sdk_dir:
+                            library_path = os.path.join(camera_sdk_dir, "build", "libscam.so")
+                        else:
+                            library_path = "/home/unitree/camera_sdk_test/build/libscam.so"
+                    cam = ScamCamera(
+                        cam_topic, img_shape, fps,
+                        library_path=library_path,
+                        device_index=int(cam_cfg.get("device_index", 0)),
+                        output_format=cam_cfg.get("output_format", "nv12"),
+                        enable_zmq=enable_zmq, zmq_port=zmq_port,
+                        enable_webrtc=enable_webrtc, webrtc_port=webrtc_port,
+                        webrtc_codec=webrtc_codec,
+                        stereo_fusion=cam_cfg.get("stereo_fusion", False),
+                        stereo_crop_left=cam_cfg.get("stereo_crop_left", 0),
+                        stereo_crop_right=cam_cfg.get("stereo_crop_right", 0),
+                        stereo_blend_alpha=cam_cfg.get("stereo_blend_alpha", 0.5),
+                        stereo_right_shift_x=cam_cfg.get("stereo_right_shift_x", 0),
+                        stereo_sbs=cam_cfg.get("stereo_sbs", False),
+                        stereo_shift_x=cam_cfg.get("stereo_shift_x", 0),
+                        stereo_split_webrtc=cam_cfg.get("stereo_split_webrtc", False),
+                        webrtc_port_left=cam_cfg.get("webrtc_port_left", None),
+                        webrtc_port_right=cam_cfg.get("webrtc_port_right", None))
+                    eye_w = int(cam_cfg.get("eye_width", 1920))
+                    eye_h = int(cam_cfg.get("eye_height", 1200))
+                    stab_cfg = dict(cam_cfg)
+                    stab_cfg["stabilization"] = cam_cfg.get("stabilization", {})
+                    try:
+                        cam.attach_stabilizer(SbsStabilizer(
+                            stab_cfg, eye_w, eye_h,
+                            int(img_shape[1]) // 2, int(img_shape[0])))
+                    except Exception as e:  # EIS 初始化失败不阻塞采集链路
+                        logger_mp.warning(f"[Image Server] EIS init failed for {cam_topic}: {e}")
+                    self._cameras[cam_topic] = cam
+                else:
+                    logger_mp.error(f"[Image Server] Unknown camera type {cam_type} for {cam_topic}, skipping...")
+                    continue
+        except Exception as e:
+            logger_mp.error(f"[Image Server] Initialization failed: {e}")
+            self._clean_up()
+            raise
+
+        logger_mp.info("[Image Server] Image server has started, waiting for client connections...")
+
+    # ------------------------------------------------------------------
+    # 无帧判定
+    #
+    # 原实现只要某路相机在一个周期内读到 None 就 set(_stop_event)，把"单帧抖动"
+    # 升级成"整个进程退出"。相机刚启动首帧未就绪、USB 单次读超时都会命中，
+    # 现场表现就是 systemd 反复重启。这里改为：连续 N 次 或 超过 T 秒才判定失效。
+    # ------------------------------------------------------------------
+    NO_FRAME_MAX_MISSES = int(os.getenv("XR_CAM_NO_FRAME_MAX_MISSES", "90"))
+    NO_FRAME_TIMEOUT_S = float(os.getenv("XR_CAM_NO_FRAME_TIMEOUT_S", "3.0"))
+
+    def _note_no_frame(self, cam_topic: str) -> bool:
+        """记录一次无帧。返回 True 表示该路相机已失效，应停止服务。"""
+        now = time.monotonic()
+        state = self._no_frame_state.get(cam_topic)
+        if state is None:
+            state = {"first": now, "misses": 0}
+            self._no_frame_state[cam_topic] = state
+        state["misses"] += 1
+
+        elapsed = now - state["first"]
+        if state["misses"] < self.NO_FRAME_MAX_MISSES and elapsed < self.NO_FRAME_TIMEOUT_S:
+            # 首次与每 30 次记录一次，避免 30Hz 刷屏
+            if state["misses"] == 1 or state["misses"] % 30 == 0:
+                logger_mp.warning(
+                    f"[Image Server] {cam_topic} returned no frame "
+                    f"(miss {state['misses']}/{self.NO_FRAME_MAX_MISSES}, {elapsed:.1f}s)"
+                )
+            return False
+
+        logger_mp.error(
+            f"[Image Server] {cam_topic} produced no frame for {elapsed:.1f}s "
+            f"({state['misses']} attempts), treating camera as failed"
+        )
+        return True
+
+    def _note_frame_ok(self, cam_topic: str) -> None:
+        self._no_frame_state.pop(cam_topic, None)
+
+    def _update_frames(self, cam_topic: str, camera: BaseCamera):
+        try:
+            interval = 1.0 / camera.get_fps()
+            next_frame_time = time.monotonic()
+            consecutive_errors = 0
+            while not self._stop_event.is_set():
+                try:
+                    camera._update_frame()
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    logger_mp.error(
+                        f"[Image Server] Error updating frame for {cam_topic} camera "
+                        f"(consecutive={consecutive_errors}): {type(e).__name__}: {e}",
+                        exc_info=(consecutive_errors == 1),
+                    )
+                    # 单次异常（拔插抖动）不再停机；连续 5 次才认为该路失效
+                    if consecutive_errors >= 5:
+                        logger_mp.error(f"[Image Server] {cam_topic} update failed repeatedly, stopping")
+                        self._stop_event.set()
+                        break
+                    time.sleep(0.1)
+                    continue
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+        except Exception as e:
+            logger_mp.error(f"[Image Server] Failed to update frames for {cam_topic} camera: {e}")
+            self._stop_event.set()
+
+    def _zmq_pub(self, cam_topic: str, camera: BaseCamera):
+        try:
+            interval = 1.0 / camera.get_fps()
+            next_frame_time = time.monotonic()
+
+            while not self._stop_event.is_set():
+                jpeg_bytes = camera.get_jpeg_bytes()
+                if jpeg_bytes is not None:
+                    self._note_frame_ok(cam_topic)
+                    self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
+                elif self._note_no_frame(cam_topic):
+                    self._stop_event.set()
+                    break
+
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+        except Exception as e:
+            # 必须带上异常本身：原先只记固定文案，真实原因（例如 AttributeError）被吞掉，
+            # 现场只能看到"Failed to publish zmq frame"而无法定位。
+            logger_mp.error(
+                f"[Image Server] Failed to publish zmq frame from {cam_topic} camera: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            self._stop_event.set()
+    
+    def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
+        try:
+            interval = 1.0 / camera.get_fps()
+            webrtc_codec = camera.get_webrtc_codec()
+            next_frame_time = time.monotonic()
+            while not self._stop_event.is_set():
+                bgr_frame = camera.get_bgr_frame()
+                bgr_frame_left = getattr(camera, 'get_bgr_frame_left', lambda: None)()
+                bgr_frame_right = getattr(camera, 'get_bgr_frame_right', lambda: None)()
+
+                published = False
+                if bgr_frame is not None:
+                    self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
+                    published = True
+                elif bgr_frame_left is not None and bgr_frame_right is not None:
+                    port_left = getattr(camera, 'get_webrtc_port_left', lambda: camera.get_webrtc_port())()
+                    port_right = getattr(camera, 'get_webrtc_port_right', lambda: camera.get_webrtc_port())()
+                    self._webrtc_publisher_manager.publish(bgr_frame_left, port_left, codec_pref=webrtc_codec)
+                    self._webrtc_publisher_manager.publish(bgr_frame_right, port_right, codec_pref=webrtc_codec)
+                    published = True
+
+                if not published:
+                    if self._note_no_frame(cam_topic):
+                        self._stop_event.set()
+                        break
+                    # 单帧/短时无帧：跳过本次，继续下一周期（不再停整机）
+                    time.sleep(max(0.0, 1.0 / max(camera.get_fps(), 1.0)))
+                    continue
+                else:
+                    self._note_frame_ok(cam_topic)
+
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+        except Exception as e:
+            # 同 _zmq_pub：把异常类型与内容、堆栈一并打出，避免真实原因被吞掉。
+            logger_mp.error(
+                f"[Image Server] Failed to publish rtc frame from {cam_topic} camera: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            self._stop_event.set()
+
+    def _clean_up(self):
+        self._responser.stop()
+        for t in self._publisher_threads:
+            if t.is_alive():
+                t.join(timeout=1.0)
+        self._publisher_threads.clear()
+        
+        try:
+            self._zmq_publisher_manager.close()
+        except Exception:
+            pass
+        try:
+            self._webrtc_publisher_manager.close()
+        except Exception:
+            pass
+
+        for cam in self._cameras.values():
+            if cam:
+                try:
+                    cam.release()
+                except Exception as e:
+                    logger_mp.error(f"[Image Server] Error releasing camera {cam._cam_topic}: {e}")
+        logger_mp.info("[Image Server] Clean up completed. Server stopped.")
+
+    # --------------------------------------------------------
+    # public api
+    # --------------------------------------------------------
+    def start(self):
+        for camera_topic, camera in self._cameras.items():
+            if camera is None:
+                logger_mp.error(f"[Image Server] Camera {camera_topic} failed to initialize previously, cannot start.")
+                self._stop_event.set()
+                self._clean_up()
+                return
+            t = threading.Thread(target=self._update_frames, args=(camera_topic, camera), daemon=True)
+            t.start()
+            self._publisher_threads.append(t)
+        if self._isaacsim_enable:
+            time.sleep(2.0)  # wait a bit for IsaacSim shared memory to be ready
+
+        for camera_topic, camera in self._cameras.items():
+            # Use longer timeout for IsaacSim cameras since they need to wait for shared memory data
+            if self._isaacsim_enable:
+                timeout = 15.0
+            else:
+                timeout = 5.0
+            ready = camera.wait_until_ready(timeout=timeout)
+            if not ready:
+                logger_mp.error(f"[Image Server] {camera_topic} ready timeout after {timeout}s.")
+                self._stop_event.set()
+                self._clean_up()
+            logger_mp.info(f"[Image Server] {camera_topic} is ready.")
+        
+        for camera_topic, camera in self._cameras.items():
+            if camera.enable_webrtc():
+                t = threading.Thread(target=self._webrtc_pub, args=(camera_topic, camera), daemon=True)
+                t.start()
+                self._publisher_threads.append(t)
+
+            if camera.enable_zmq():
+                t = threading.Thread(target=self._zmq_pub, args=(camera_topic, camera), daemon=True)
+                t.start()
+                self._publisher_threads.append(t)
+
+    def wait(self):
+        self._stop_event.wait()
+        self._clean_up()
+
+    def stop(self):
+        self._stop_event.set()
+
+# ========================================================
+# utility functions
+# ========================================================
+def signal_handler(server, signum, frame):
+    logger_mp.info(f"[Image Server] Received signal {signum}, initiating graceful shutdown...")
+    server.stop()
+
+def set_performance_mode(cores=[0, 1, 2, 3, 4, 5]):
+    import psutil
+    try:
+        p = psutil.Process(os.getpid())
+        
+        # Set CPU affinity for the process and all its threads
+        p.cpu_affinity(cores)
+        logger_mp.info(f"[Performance] CPU Affinity locked to: {cores}")
+
+    except psutil.AccessDenied:
+        logger_mp.warning("[Performance] Access Denied: Run as sudo for full optimization")
+    except Exception as e:
+        logger_mp.error(f"[Performance] Error: {e}")
+
+def run_isaacsim_server():
+    # Load config file, start image server
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cam_config = yaml.safe_load(f)
+    except Exception as e:
+        logger_mp.error(f"Failed to load configuration file at {CONFIG_PATH}: {e}")
+        exit(1)
+    # start image server
+    server = ImageServer(cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=True)
+    server.start()
+    return server
+
+def main():
+    logger_mp.info(
+        "\n====================== Image Server Startup Guide ======================\n"
+        "Please first read this repo's README.md to learn how to configure and use the teleimager.\n"
+        "To discover connected cameras, run the following command:\n"
+        "\n"
+        "    teleimager-server --cf\n"
+        "\n"
+        "The '--cf' flag means 'camera find'.\n"
+        "This will list all detected cameras and their details (video paths, serial numbers and physical path etc.).\n"
+        "Use that information to fill in your 'cam_config_server.yaml' file.\n"
+        "Once configured, you can start the image server with:\n"
+        "\n"
+        "    teleimager-server\n"
+        "\n"
+        "Note:\n"
+        " - If you have RealSense cameras, add the '--rs' flag to enable RealSense support.\n"
+        " - Make sure you have proper permissions to access the camera devices (e.g., run with sudo or set udev rules).\n"
+        "=========================================================================="
+    )
+
+    # command line args
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cf', action = 'store_true', help = 'Enable camera found mode, print all connected cameras info')
+    parser.add_argument('--rs', action = 'store_true', help = 'Enable RealSense camera mode. Otherwise only find UVC/OpenCV cameras.')
+    parser.add_argument('--no-affinity', action='store_false', dest='affinity', help='Disable CPU affinity setting for performance optimization.')
+    parser.add_argument('--config', type=str, default=None, help='Path to camera config YAML file. Defaults to cam_config_server.yaml in the repo root.')
+    args = parser.parse_args()
+
+    config_path = Path(args.config) if args.config else CONFIG_PATH
+
+    if args.affinity:
+        set_performance_mode(cores=[0, 1, 2, 3, 4, 5])
+
+    # if enable camera finder mode, just print cameras info and exit
+    if args.cf:
+        CameraFinder(realsense_enable=args.rs, verbose=True)
+        exit(0)
+
+    # Load config file, start image server
+    try:
+        with open(config_path, "r") as f:
+            cam_config = yaml.safe_load(f)
+    except Exception as e:
+        logger_mp.error(f"Failed to load configuration file at {config_path}: {e}")
+        exit(1)
+
+    # start image server
+    server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)
+    server.start()
+
+    # graceful shutdown handling
+    signal.signal(signal.SIGINT, functools.partial(signal_handler, server))
+    signal.signal(signal.SIGTERM, functools.partial(signal_handler, server))
+
+    logger_mp.info("[Image Server] Running... Press Ctrl+C to exit.")
+    server.wait()
+
+    # usbhub plugout may cause block process exit, no better solution for now。
+    # 注意：不能用 os.killpg(os.getpgrp(), 9) —— SIGKILL 会发给整个进程组，
+    # 通过 ros2 launch / bash 脚本启动时会把父脚本和同组节点一起打死，
+    # 且无法捕获、日志不落地。os._exit 只结束当前进程，跳过可能卡住的线程 join。
+    time.sleep(0.5)
+    os._exit(0)
+
+if __name__ == "__main__":
+    main()

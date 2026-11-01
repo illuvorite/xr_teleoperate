@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 3,
+  "name": "xr_teleoperate",
+  "displayName": "XR 遥操作服务（机器人端）",
+  "purpose": "部署在 Unitree G1 上的 XR/VR 遥操作服务，为 Web 控制台提供遥操画面与相机图像流。",
+  "icon": "XR",
+  "defaultDirectory": "/home/unitree/xr_teleoperate/",
+  "version": "1.0.0",
+  "arch": [
+    "arm64"
+  ],
+  "type": "python",
+  "description": "XR 遥操作主程序（Unitree G1_29）。部署后注册 xr-teleimager、xr-heartbeat 两个服务；相机服务由 scripts/start_camera.sh 启动（自动探测双目→深度→无相机，无相机时服务仍正常启动）；遥操作主程序只允许手动启动（scripts/start_teleop.sh，可选择无手/两指夹爪/三指夹爪/因时灵巧手）。包内自带 dex1-1 夹爪服务（third_party/dex1_1_service，含预编译 arm64 产物），由 start_teleop.sh 在启动遥操前判重拉起，无需单独安装。",
+  "packageType": "zip",
+  "whitelist": true,
+  "buildDate": "REPLACE_WITH_BUILD_DATE_UTC",
+  "buildType": "release",
+  "includeSdk": false,
+  "gitSha": "",
+  "buildArchitecture": "arm64",
+  "vendor": "illusory",
+  "timestamp": "REPLACE_WITH_UTC_NOW",
+  "applicationInfo": {
+    "sizeBytes": 0,
+    "maintainer": "illusory <1596303130@qq.com>",
+    "signerFingerprint": ""
+  },
+  "entrypoint": {
+    "command": "./scripts/start_teleop.sh",
+    "workdir": "."
+  },
+  "service": {
+    "name": "xr-teleimager",
+    "installScript": "install_service.sh",
+    "manualStartScripts": [
+      "scripts/start_teleop.sh"
+    ],
+    "autostart": true
+  },
+  "healthCheck": {
+    "type": "process",
+    "pattern": "teleimager",
+    "timeoutSeconds": 60
+  }
+}

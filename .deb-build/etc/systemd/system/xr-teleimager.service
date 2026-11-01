@@ -1,0 +1,27 @@
+[Unit]
+Description=XR Teleimager (Image Server) - 60001
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/opt/xr-teleoperate-main
+EnvironmentFile=-/etc/xr-teleoperate/env.conf
+# RealSense 要求 usbfs 内存上限 >= 1000MB（内核默认 16MB），过小会导致
+# "Failed to resubmit video URB" / "Frame didn't arrive within 5000" / USB 链路复位，
+# 图像服务跑几分钟后自杀。usbcore 在 Jetson 上是内建模块（modprobe.d 不生效），
+# 且相关 sysfs 只有 root 能写 —— 故用 "+" 前缀无视 User= 提权执行 tune-usb 子命令。
+ExecStartPre=+/bin/bash /opt/xr-teleoperate-main/install_service.sh tune-usb
+ExecStart=/opt/xr-teleoperate-main/scripts/start_camera.sh
+Restart=on-failure
+RestartSec=5
+# teleimager-server 不处理 SIGTERM：systemd 默认 TimeoutStopSec=90s，停止期间服务
+# 会卡在 deactivating，部署器这时点「启动」直接报「服务当前状态: 0 / deactivating」。
+# 缩到 8s：留一点清理时间，又不让停止流程长时间挂住（超时后 systemd 自己 SIGKILL）。
+TimeoutStopSec=8s
+StandardOutput=append:/var/log/xr-teleoperate/xr-teleimager.log
+StandardError=append:/var/log/xr-teleoperate/xr-teleimager.log
+
+[Install]
+WantedBy=multi-user.target

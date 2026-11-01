@@ -1,0 +1,24 @@
+#!/bin/bash
+# postinst — XR-Teleoperate main installation script
+set -e
+
+# 1. 创建运行目录
+mkdir -p /var/log/xr-teleoperate
+chown -R unitree:unitree /var/log/xr-teleoperate 2>/dev/null || true
+
+# 2. 项目文件 chown(保险)
+chown -R unitree:unitree /opt/xr-teleoperate-main 2>/dev/null || true
+
+# 3. 让 xr-teleop-control 可执行
+chmod 755 /usr/bin/xr-teleop-control
+
+# 4. systemd reload(只刷新,不 enable)
+systemctl daemon-reload
+
+echo "[postinst] XR-Teleoperate installed. Next steps:"
+echo "  sudo -u unitree xr-teleop-control install-env"
+echo "  xr-teleop-control start"
+echo "  xr-teleop-control teleop   # 仅手动启动遥操作主程序(高危,会接管机器人手臂)"
+echo "[postinst] 注意:scripts/start_teleop.sh 不注册 systemd 服务,也不设开机自启。"
+
+exit 0
