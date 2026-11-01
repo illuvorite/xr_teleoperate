@@ -45,6 +45,14 @@ CONDA_BIN="${XR_TELEOP_CONDA_BIN:-/home/unitree/miniconda3}"
 CONDA_ENV="${XR_TELEOP_CONDA_ENV:-tv}"
 PY="$CONDA_BIN/envs/$CONDA_ENV/bin/python"
 
+# cv2 依赖 OpenMP 运行时，而 libgomp 用的是静态 TLS，必须在进程启动前预加载；
+# 否则 import cv2 会报 `libgomp.so.1: cannot allocate memory in static TLS block`，
+# 表现为遥操一起来就 ImportError 退出。start_camera.sh 一直有这一步，本脚本此前漏了。
+GOMP_LIB="$CONDA_BIN/envs/$CONDA_ENV/lib/libgomp.so.1"
+if [ -f "$GOMP_LIB" ]; then
+  export LD_PRELOAD="$GOMP_LIB${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
 RUN_USER="${XR_TELEOP_RUN_USER:-unitree}"
 STATE_DIR="${XR_TELEOP_STATE_DIR:-/home/unitree/.cache/xr_teleoperate}"
 PID_FILE="$STATE_DIR/teleop-manual.pid"
@@ -450,7 +458,11 @@ build_cmd() {
   fi
   echo "[teleop] 图像服务地址：$ip（网卡 ${ifc:-?}）   显示模式：$DISPLAY_MODE" >&2
 
-  CMD=(python teleop/teleop_hand_and_arm.py --arm G1_29)
+  # 必须用 conda 环境里的绝对路径解释器，不能写裸 `python`。
+  # 后台启动走的是 `env PATH="$CONDA_BIN/bin:$PATH"`，那里只加了 conda 的 base bin，
+  # 裸 python 会解析成 base 环境的解释器 —— 缺 yaml / dex_retargeting，
+  # 表现为启动后立刻 ModuleNotFoundError（yaml 在第 2 行就炸）。
+  CMD=("$PY" teleop/teleop_hand_and_arm.py --arm G1_29)
   if [ "${#EE_ARGS[@]}" -gt 0 ]; then
     CMD+=("${EE_ARGS[@]}")
   fi
@@ -526,6 +538,11 @@ PY
 
 # ---------------------------------------------------------------- 子命令
 do_start() {
+  if [ ! -x "$PY" ]; then
+    echo "TELEOP_RUNNING=0"
+    echo "ERROR=找不到 conda 环境 ${CONDA_ENV} 的解释器：$PY（先跑环境安装）"
+    return 1
+  fi
   if proc_running; then
     echo "TELEOP_RUNNING=1"
     echo "TELEOP_PID=$(proc_pid)"

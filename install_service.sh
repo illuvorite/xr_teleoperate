@@ -345,6 +345,28 @@ EOF
 # ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
+ensure_pkill_sudoers() {
+    # 官方 master_service 会在 videohub_pc4 被杀后一两秒内把它重新拉起,继续抢占
+    # RealSense 的 /dev/video4。unit 里的 ExecStartPre 以 root 做的那次 pkill 只有一发,
+    # 拦不住这次重拉;start_camera.sh 必须自己再清一遍,走的是 `sudo -n pkill`,
+    # 没有免密规则就会失败退出(表现为服务启动约 4 秒后 status=1,重启 5 次后 failed)。
+    # 这里补一条最小授权:只放开 pkill,不放开其它命令。
+    local dropin="/etc/sudoers.d/xr-console-pkill"
+    local tmp
+    tmp="$(mktemp)" || return 0
+    cat >"$tmp" <<EOF
+# xr_teleoperate: 相机服务需要用 root 清掉抢占 RealSense 的 videohub_pc4
+${SERVICE_USER} ALL=(ALL) NOPASSWD: /usr/bin/pkill, /bin/pkill
+EOF
+    if visudo -cf "$tmp" >/dev/null 2>&1; then
+        install -m 440 -o root -g root "$tmp" "$dropin"
+        echo "[install_service] 已写入 pkill 免密规则: $dropin"
+    else
+        echo "[install_service] WARN: pkill 免密规则未通过校验,已跳过(相机可能因 videohub 占用启动失败)" >&2
+    fi
+    rm -f "$tmp"
+}
+
 do_install() {
     # 1. 运行目录
     mkdir -p "$LOG_DIR"
@@ -414,6 +436,8 @@ EOF
     # 5. 写 unit(xr-teleimager / xr-heartbeat;不生成 xr-teleop)
     write_units "$PAYLOAD"
     systemctl daemon-reload
+    # 5.1 pkill 免密:start_camera.sh 释放 RealSense 时要 sudo -n pkill
+    ensure_pkill_sudoers
 
     # 注：RealSense 的 USB 内核参数不需要在这里单独处理 —— 第 7 步 restart xr-teleimager
     #     时，unit 的 ExecStartPre 会自动以 root 跑一次 tune-usb。
